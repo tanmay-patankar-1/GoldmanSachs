@@ -23,13 +23,31 @@ Use `npm run build` to type-check and create a production build, and `npm run li
 The Vite development server proxies `/api` requests to the Python service on port `8765`.
 The analysis service re-reads source records when files change; the **Recalculate** action forces a refresh.
 
+Run backend tests from the repository root in PowerShell:
+
+```powershell
+$env:PYTHONPATH = "backend"
+python -m unittest discover -s backend/tests
+```
+
 ## Demo behavior
 
 - Borrower, history, assignment, stage, and control examples are based on the synthetic challenge pack.
-- `src/data/mockData.ts` contains portfolio and workflow UI data.
+- `src/data/mockData.ts` contains offline fallback data; when the API is available, portfolio rows, documents, workflow status, and reviewers come from extracted challenge packets.
 - Fraud signals, evidence references, scores, and network relationships come from the Python analysis service.
 - The review-priority index is an uncalibrated evidence-family coverage measure, not a probability or confirmed fraud finding.
-- Review actions and the simulation clock update the local interface only. They do not send decisions, create holds, or contact bank employees.
+- Workflow actions and the simulation clock are persisted locally in SQLite and the challenge simulation state file. No external messages are sent.
+- Reviewer IDs are demo metadata, not authenticated identities. Do not use this service for real lending decisions.
+- Known-rule checks are first-pass document heuristics. A human rationale is required to resolve an alerted or unevaluable check; this records review, not proof that a document is valid or fraud-free.
+- PDF text extraction depends on machine-readable text and the supplied layouts. Unreadable scans and unsupported layouts can leave fields or checks unevaluable.
+
+## Application workflow
+
+The local API scans the shared-folder application PDFs on workflow requests, extracts application facts with source paths, and builds a document checklist from the challenge stage rules. It exposes `GET /api/workflow`, `POST /api/workflow/advance-clock`, and `POST /api/workflow/{id}/actions`.
+
+The workflow follows Intake → Credit → Committee → Product → Committed → Closed. Stage advancement is blocked by required documents, unresolved known-rule checks, missing product/vendor verification, commitment documentation, or closing controls. Human approvals are recorded with an actor ID and rationale where required. The simulation clock creates durable SLA alerts at 100%, 150%, and 200% of the applicable stage SLA, routed to the configured owner/escalation contact.
+
+Actions, alerts, and review history are local demo state. Role checks enforce the challenge's routing rules but are not authentication or authorization for a deployed bank system. Uploads are not accepted through an API endpoint; placing a new supported PDF in a shared-folder deal directory causes the next workflow scan to recalculate extracted data and checklist status.
 
 ## Cross-deal patterns
 

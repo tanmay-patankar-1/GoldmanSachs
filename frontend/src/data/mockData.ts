@@ -1,3 +1,5 @@
+import type { WorkflowLoan } from './fraudApi'
+
 export type Stage =
   | 'Intake'
   | 'Credit'
@@ -33,6 +35,7 @@ export type Loan = {
   accent: string
   neededBy?: string
   linkedIds: string[]
+  workflow?: WorkflowLoan
 }
 
 export const stages: Stage[] = [

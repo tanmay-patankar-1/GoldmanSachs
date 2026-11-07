@@ -30,7 +30,6 @@ import {
   Shield,
   ShieldAlert,
   ShieldCheck,
-  Sparkles,
   Users,
   X,
 } from 'lucide-react'
@@ -45,9 +44,13 @@ import {
   type Stage,
 } from './data/mockData'
 import {
+  advanceWorkflowClock,
+  fetchWorkflow,
   fetchFraudAnalysis,
+  postWorkflowAction,
   type CrossDealSignal,
   type FraudAnalysis,
+  type WorkflowSnapshot,
 } from './data/fraudApi'
 import './App.css'
 
@@ -120,6 +123,13 @@ function findLoanForBorrower(name: string, loans: Loan[]) {
   )
 }
 
+function getApplicationValue(
+  application: NonNullable<Loan['workflow']>['application'],
+  key: string,
+) {
+  return application[key]?.value ?? ''
+}
+
 const riskTone: Record<RiskLevel, string> = {
   Low: 'low',
   Moderate: 'moderate',
@@ -129,7 +139,6 @@ const riskTone: Record<RiskLevel, string> = {
 
 function App() {
   const [view, setView] = useState<ViewId>('overview')
-  const [loans, setLoans] = useState(initialLoans)
   const [selectedLoanId, setSelectedLoanId] = useState<string | null>(null)
   const [selectedSignalId, setSelectedSignalId] = useState('')
   const [search, setSearch] = useState('')
@@ -137,12 +146,94 @@ function App() {
   const [riskFilter, setRiskFilter] = useState('All risk levels')
   const [toast, setToast] = useState('')
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
-  const [simHour, setSimHour] = useState(10)
   const [networkFocusId, setNetworkFocusId] = useState('DP-26019')
   const [fraudAnalysis, setFraudAnalysis] = useState<FraudAnalysis | null>(null)
   const [analysisError, setAnalysisError] = useState('')
   const [analysisLoading, setAnalysisLoading] = useState(true)
   const [analysisRefreshing, setAnalysisRefreshing] = useState(false)
+  const [workflow, setWorkflow] = useState<WorkflowSnapshot | null>(null)
+  const [workflowError, setWorkflowError] = useState('')
+
+  const loans = useMemo(() => {
+    if (!workflow) return initialLoans
+    const accents = ['blue', 'violet', 'amber', 'teal', 'orange']
+    return workflow.loans.map((item, index): Loan => {
+      const application = item.application
+      const borrowerScore = fraudAnalysis?.scores.find(
+        (score) =>
+          normalizeBorrowerName(score.borrower) ===
+          normalizeBorrowerName(item.borrower),
+      )?.score ?? 0
+      const flaggedChecks = item.checks.filter((check) => check.status === 'flagged')
+      const relatedSignals = fraudAnalysis?.signals.filter((signal) =>
+        signal.borrowers.some(
+          (borrower) =>
+            normalizeBorrowerName(borrower) === normalizeBorrowerName(item.borrower),
+        ),
+      ) ?? []
+      const riskScore = Math.max(
+        borrowerScore,
+        flaggedChecks.length > 0 ? 65 : 0,
+      )
+      const risk: RiskLevel =
+        riskScore >= 75 ? 'High' :
+          riskScore >= 50 ? 'Elevated' :
+            riskScore >= 20 ? 'Moderate' : 'Low'
+      const requirements = item.requiredDocuments
+      const missingDocuments = requirements
+        .filter((document) => document.status !== 'received')
+        .map((document) => document.label)
+      const requestedAmount = application.amountRaw?.numericValue ?? 0
+      const revenue = application.revenueRaw?.numericValue ?? 0
+      const term = application.termRaw?.numericValue ?? 0
+      const fullName = item.borrower.trim()
+      const initials = fullName
+        .split(/\s+/)
+        .slice(0, 2)
+        .map((part) => part[0] ?? '')
+        .join('')
+        .toUpperCase()
+      const nextAction =
+        item.blockers[0] ??
+        (['Credit', 'Committee', 'Committed', 'Closed'].includes(item.stage)
+          ? `${item.stage} human decision`
+          : `Review ${item.stage.toLowerCase()} requirements`)
+      const status = item.status.replaceAll('_', ' ')
+      return {
+        id: item.id,
+        name: fullName,
+        legalName: fullName,
+        industry: getApplicationValue(application, 'industry') || 'Not extracted',
+        amount: requestedAmount,
+        product: getApplicationValue(application, 'product') || 'Not extracted',
+        purpose: getApplicationValue(application, 'purpose') || 'Not extracted',
+        term,
+        stage: item.stage as Stage,
+        risk,
+        riskScore,
+        status: status.charAt(0).toUpperCase() + status.slice(1),
+        relationshipManager: item.relationshipManager || 'Unassigned',
+        creditOfficer: item.creditOfficer || 'Unassigned',
+        lastUpdated: 'Current workflow',
+        nextAction,
+        documents: {
+          received: requirements.filter((document) => document.status === 'received').length,
+          required: requirements.length,
+        },
+        missingDocuments,
+        flags: [
+          ...flaggedChecks.map((check) => check.code),
+          ...relatedSignals.map((signal) => signal.title),
+        ],
+        revenue,
+        initials: initials || 'NA',
+        accent: accents[index % accents.length],
+        neededBy: getApplicationValue(application, 'fundsNeededBy') || undefined,
+        linkedIds: [item.id],
+        workflow: item,
+      }
+    })
+  }, [fraudAnalysis, workflow])
 
   const acceptAnalysis = (result: FraudAnalysis) => {
       setFraudAnalysis(result)
@@ -183,6 +274,25 @@ function App() {
       })
       .finally(() => {
         if (active) setAnalysisLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    void fetchWorkflow()
+      .then((result) => {
+        if (!active) return
+        setWorkflow(result)
+        setWorkflowError('')
+      })
+      .catch((error: unknown) => {
+        if (!active) return
+        setWorkflowError(
+          error instanceof Error ? error.message : 'Unable to load workflow data.',
+        )
       })
     return () => {
       active = false
@@ -237,41 +347,122 @@ function App() {
     window.setTimeout(() => setToast(''), 3200)
   }
 
-  const updateLoan = (id: string, updates: Partial<Loan>) => {
-    setLoans((current) =>
-      current.map((loan) => (loan.id === id ? { ...loan, ...updates } : loan)),
-    )
+  const handleAction = async (loan: Loan, actionLabel: string) => {
+    const item = loan.workflow
+    if (!item) {
+      notify('Connect to the workflow service before recording a decision.')
+      return
+    }
+    let action = ({
+      Approve: 'approve',
+      'Request information': 'request_info',
+      'Request fraud hold': 'request_hold',
+      Escalate: 'escalate',
+      'Mark reviewed': 'mark_reviewed',
+    } as Record<string, string>)[actionLabel] ?? actionLabel
+    let alertId = ''
+    let alertOwner = ''
+    let checkCode = ''
+    const alertAcknowledgement = action.match(/^acknowledge_alert:(\d+):([^:]+)$/)
+    if (alertAcknowledgement) {
+      action = 'acknowledge_alert'
+      alertId = alertAcknowledgement[1]
+      alertOwner = alertAcknowledgement[2]
+    } else {
+      const alertIdOnly = action.match(/^acknowledge_alert:(\d+)$/)
+      if (alertIdOnly) {
+        action = 'acknowledge_alert'
+        alertId = alertIdOnly[1]
+      }
+    }
+    const checkResolution = action.match(/^resolve_check:([^:]+)$/)
+    if (checkResolution) {
+      action = 'resolve_check'
+      checkCode = checkResolution[1]
+    }
+    let note = ''
+    let product = ''
+    let pricing = ''
+    if (['approve', 'decline', 'request_info', 'request_hold', 'escalate', 'place_hold', 'release_hold', 'clear_fraud', 'verify_vendor', 'verify_disbursement', 'resolve_check', 'release_funds'].includes(action)) {
+      const prompts: Record<string, string> = {
+        approve: 'Rationale for approving and advancing this application',
+        decline: 'Reason for declining this application',
+        request_info: 'Specify the information needed from the borrower',
+        request_hold: 'Supporting evidence and rationale for requesting a human fraud hold review',
+        escalate: 'Reason for escalating this application',
+        place_hold: 'Evidence and rationale for placing a fraud hold',
+        release_hold: 'Rationale for releasing the fraud hold',
+        clear_fraud: 'Evidence and rationale for clearing the final fraud review',
+        verify_vendor: 'How were the vendor identity and remittance account independently verified?',
+        verify_disbursement: 'How was the disbursement account independently verified?',
+        resolve_check: 'Record the human review rationale. This does not change the automated check result.',
+        release_funds: 'Rationale for authorizing this funding release',
+      }
+      const response = window.prompt(prompts[action])
+      if (response === null) return
+      note = response.trim()
+      if (!note) {
+        notify('A rationale is required for this workflow action.')
+        return
+      }
+    } else if (action === 'configure_product') {
+      const selectedProduct = window.prompt(
+        'Confirmed loan product',
+        getApplicationValue(item.application, 'product'),
+      )
+      if (selectedProduct === null) return
+      const selectedPricing = window.prompt('Confirmed pricing and term')
+      if (selectedPricing === null) return
+      product = selectedProduct.trim()
+      pricing = selectedPricing.trim()
+    }
+    const fraudOperationsAction = ['place_hold', 'release_hold', 'clear_fraud'].includes(action)
+    const actor = alertOwner || (fraudOperationsAction ? 'victor.hale' : item.requiredActor)
+    try {
+      const payload: Record<string, string> = { action, actor }
+      if (note) payload.note = note
+      if (product) payload.product = product
+      if (pricing) payload.pricing = pricing
+      if (alertId) payload.alertId = alertId
+      if (checkCode) payload.checkCode = checkCode
+      setWorkflow(await postWorkflowAction(item.id, payload))
+      setWorkflowError('')
+      notify(`${actionLabel} recorded for ${loan.name}.`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Workflow action failed.'
+      setWorkflowError(message)
+      notify(message)
+    }
   }
 
-  const handleAction = (loan: Loan, action: string) => {
-    if (action === 'Approve') {
-      updateLoan(loan.id, {
-        status: 'Approved · human review recorded',
-        nextAction: 'Continue to next workflow step',
-      })
-    } else if (action === 'Request information') {
-      updateLoan(loan.id, {
-        status: 'Information requested',
-        nextAction: 'Awaiting borrower response',
-      })
-    } else if (action === 'Request fraud hold') {
-      updateLoan(loan.id, {
-        status: 'Fraud hold requested',
-        nextAction: 'Awaiting Fraud Operations decision',
-      })
-    } else if (action === 'Escalate') {
-      updateLoan(loan.id, {
-        status: 'Escalated to manager',
-        nextAction: 'Manager review',
-      })
-    } else {
-      updateLoan(loan.id, {
-        status: 'Review completed',
-        nextAction: 'Continue to next workflow step',
-      })
+  const advanceClock = async () => {
+    try {
+      setWorkflow(await advanceWorkflowClock('1h'))
+      setWorkflowError('')
+      notify('Simulation clock advanced by one hour.')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to advance simulation time.'
+      setWorkflowError(message)
+      notify(message)
     }
-    notify(`${action} recorded for ${loan.name}. Demo only; no request was sent.`)
   }
+
+  const simulationDate = workflow
+    ? new Intl.DateTimeFormat('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+        timeZone: 'America/Chicago',
+      }).format(new Date(workflow.now))
+    : 'Workflow offline'
+  const simulationTime = workflow
+    ? new Intl.DateTimeFormat('en-US', {
+        hour: 'numeric',
+        minute: '2-digit',
+        timeZone: 'America/Chicago',
+        timeZoneName: 'short',
+      }).format(new Date(workflow.now))
+    : '—'
 
   const navigate = (nextView: ViewId) => {
     setView(nextView)
@@ -379,21 +570,17 @@ function App() {
           </div>
           <div className="topbar-actions">
             <div className="sim-clock">
-              <span className="clock-live-dot" />
+              <span className={`clock-live-dot ${workflow ? '' : 'clock-offline'}`} />
               <span>SIM</span>
-              <strong>Nov 4, 2026</strong>
+              <strong>{simulationDate}</strong>
               <span className="clock-divider" />
-              <strong>
-                {simHour % 12 || 12}:00 {simHour % 24 >= 12 ? 'PM' : 'AM'} CT
-              </strong>
+              <strong>{simulationTime}</strong>
               <button
                 className="clock-advance"
-                aria-label="Advance demo clock by one hour"
-                title="Advance demo clock by one hour"
-                onClick={() => {
-                  setSimHour((hour) => hour + 1)
-                  notify('Demo clock advanced by one hour.')
-                }}
+                aria-label="Advance simulation clock by one hour"
+                title="Advance simulation clock by one hour"
+                disabled={!workflow}
+                onClick={() => void advanceClock()}
               >
                 +1h
               </button>
@@ -404,16 +591,25 @@ function App() {
               onClick={() => navigate('workflow')}
             >
               <Bell size={18} />
-              <span className="notification-dot" />
+              {(workflow?.alerts.some((alert) => !alert.acknowledged) ?? false) && (
+                <span className="notification-dot" />
+              )}
             </button>
             <div className="topbar-avatar">AR</div>
           </div>
         </header>
 
         <div className="page-content">
+          {workflowError && (
+            <div className="workflow-error-banner" role="alert">
+              <AlertTriangle size={15} />
+              <span>Live workflow unavailable. This view may contain demonstration data. {workflowError}</span>
+            </div>
+          )}
           {view === 'overview' && (
             <Dashboard
               loans={loans}
+              workflow={workflow}
               onOpenLoan={(id) => setSelectedLoanId(id)}
               onNavigate={navigate}
             />
@@ -461,8 +657,10 @@ function App() {
           {view === 'workflow' && (
             <WorkflowMonitor
               loans={loans}
+              workflow={workflow}
               onOpenLoan={(id) => setSelectedLoanId(id)}
               onNavigate={navigate}
+              onAction={(loan, action) => void handleAction(loan, action)}
             />
           )}
         </div>
@@ -517,33 +715,46 @@ function PageHeading({
 
 function Dashboard({
   loans,
+  workflow,
   onOpenLoan,
   onNavigate,
 }: {
   loans: Loan[]
+  workflow: WorkflowSnapshot | null
   onOpenLoan: (id: string) => void
   onNavigate: (view: ViewId) => void
 }) {
   const active = loans.filter((loan) => loan.stage !== 'Closed').length
-  const pending = loans.filter((loan) =>
+  const pending = workflow?.pendingDecisions.length ?? loans.filter((loan) =>
     ['Credit', 'Committee', 'Committed'].includes(loan.stage),
   ).length
   const flagged = loans.filter(
-    (loan) => loan.risk === 'High' || loan.risk === 'Elevated',
+    (loan) => loan.flags.length > 0 || loan.risk === 'High' || loan.risk === 'Elevated',
   ).length
+  const overdue = workflow?.alerts.filter((alert) => !alert.acknowledged).length ?? 0
   const attention = loans.filter(
     (loan) =>
       loan.missingDocuments.length > 0 ||
       loan.risk === 'High' ||
-      loan.status.includes('Priority'),
+      loan.status.includes('Priority') ||
+      Boolean(loan.workflow?.blockers.length),
   )
+  const dateLabel = workflow
+    ? new Intl.DateTimeFormat('en-US', {
+        weekday: 'long',
+        month: 'long',
+        day: 'numeric',
+        year: 'numeric',
+        timeZone: 'America/Chicago',
+      }).format(new Date(workflow.now)).toUpperCase()
+    : 'DEMONSTRATION DATA'
 
   return (
     <>
       <PageHeading
-        eyebrow="WEDNESDAY, NOVEMBER 4, 2026"
+        eyebrow={dateLabel}
         title="Portfolio overview"
-        subtitle="Commercial lending · Sample week operations"
+        subtitle="Commercial lending · Current application and review status"
       >
         <button className="button button-secondary" onClick={() => onNavigate('applications')}>
           <BriefcaseBusiness size={16} />
@@ -552,16 +763,16 @@ function Dashboard({
         <button className="button button-primary" onClick={() => onNavigate('fraud')}>
           <Shield size={16} />
           Review alerts
-          <span className="button-count">3</span>
+          <span className="button-count">{flagged}</span>
         </button>
       </PageHeading>
 
       <div className="demo-banner">
         <span>
           <strong>Challenge simulation</strong>
-          <span> Synthetic borrower data · Risk signals and actions are illustrative</span>
+          <span> Synthetic borrower data · Human decisions and risk signals require review</span>
         </span>
-        <span className="demo-banner-right">SAMPLE WEEK <span>·</span> 13 BORROWERS</span>
+        <span className="demo-banner-right">{workflow ? 'LIVE WORKFLOW' : 'OFFLINE DEMO'} <span>·</span> {loans.length} APPLICATIONS</span>
       </div>
 
       <section className="metric-grid" aria-label="Portfolio overview">
@@ -582,15 +793,15 @@ function Dashboard({
         <MetricCard
           label="Fraud alerts"
           value={String(flagged)}
-          note="Across 3 connected cases"
-          delta="1 high priority"
+          note="Known checks and cross-deal leads"
+          delta="Requires human review"
           tone="rose"
         />
         <MetricCard
           label="Overdue / at risk"
-          value="2"
-          note="Approaching SLA limit"
-          delta="View workflow"
+          value={String(overdue)}
+          note="SLA alerts from simulation clock"
+          delta={overdue ? 'Review escalations' : 'No SLA alerts'}
           tone="amber"
         />
       </section>
@@ -1504,14 +1715,41 @@ function NetworkExplorer({
 
 function WorkflowMonitor({
   loans,
+  workflow,
   onOpenLoan,
   onNavigate,
+  onAction,
 }: {
   loans: Loan[]
+  workflow: WorkflowSnapshot | null
   onOpenLoan: (id: string) => void
   onNavigate: (view: ViewId) => void
+  onAction: (loan: Loan, action: string) => void
 }) {
-  const stalled = loans.filter((loan) => loan.nextAction.toLowerCase().includes('decision') || loan.risk === 'High')
+  const pending = workflow?.pendingDecisions
+    .map((decision) => loans.find((loan) => loan.workflow?.id === decision.dealId))
+    .filter((loan): loan is Loan => Boolean(loan)) ??
+    loans.filter((loan) =>
+      ['Credit', 'Committee', 'Committed', 'Closed'].includes(loan.stage),
+    )
+  const activeAlerts = workflow?.alerts.filter((alert) => !alert.acknowledged) ?? []
+  const onTrack = workflow
+    ? loans.filter((loan) => {
+        const hours = loan.workflow?.hoursInStage ?? 0
+        const sla = loan.workflow?.slaHours ?? 0
+        return sla > 0 && hours / sla < 0.75
+      }).length
+    : 0
+  const approaching = workflow
+    ? loans.filter((loan) => {
+        const hours = loan.workflow?.hoursInStage ?? 0
+        const sla = loan.workflow?.slaHours ?? 0
+        return sla > 0 && hours / sla >= 0.75 && hours / sla < 1
+      }).length
+    : 0
+  const escalatedDeals = new Set(
+    activeAlerts.filter((alert) => alert.level >= 2).map((alert) => alert.deal_id),
+  ).size
   return (
     <>
       <PageHeading
@@ -1524,13 +1762,34 @@ function WorkflowMonitor({
         </button>
         <div className="live-status"><span /> SIM CLOCK ACTIVE</div>
       </PageHeading>
-      <div className="demo-banner"><Clock3 size={15} /><span>Stage SLAs run on wall-clock simulation time. Advancing the clock is available in the header.</span></div>
+      <div className="demo-banner"><Clock3 size={15} /><span>Stage SLAs use the challenge simulation clock. Advancing time creates persisted, owner-routed alerts. Reviewer IDs are simulated; this demo does not authenticate users or send notifications.</span></div>
       <section className="workflow-stats">
-        <div><span>On track</span><strong>9</strong><i className="stat-green"><ArrowUpRight size={13} /> 69%</i></div>
-        <div><span>Approaching SLA</span><strong>2</strong><i className="stat-amber"><Clock3 size={13} /> Alert at 100%</i></div>
-        <div><span>Escalations due</span><strong>1</strong><i className="stat-rose"><ArrowUpRight size={13} /> At 150% SLA</i></div>
-        <div><span>Human decisions</span><strong>4</strong><i className="stat-blue"><Users size={13} /> Awaiting response</i></div>
+        <div><span>On track</span><strong>{onTrack}</strong><i className="stat-green"><ArrowUpRight size={13} /> Under 75% SLA</i></div>
+        <div><span>Approaching SLA</span><strong>{approaching}</strong><i className="stat-amber"><Clock3 size={13} /> Alert at 100%</i></div>
+        <div><span>Escalations due</span><strong>{escalatedDeals}</strong><i className="stat-rose"><ArrowUpRight size={13} /> At 150% SLA</i></div>
+        <div><span>Human decisions</span><strong>{pending.length}</strong><i className="stat-blue"><Users size={13} /> Awaiting response</i></div>
       </section>
+      {workflow?.historicalSla.available && (
+        <section className="panel historical-sla-panel">
+          <div className="panel-heading">
+            <div>
+              <h2>Historical SLA baseline</h2>
+              <p>Completed stage events in the challenge dataset · operational context, not fraud evidence</p>
+            </div>
+            <strong>{workflow.historicalSla.breaches} / {workflow.historicalSla.events} <span>({((workflow.historicalSla.breachRate ?? 0) * 100).toFixed(1)}%)</span></strong>
+          </div>
+          <div className="historical-sla-grid">
+            {workflow.historicalSla.byStage.map((item) => (
+              <div key={item.stage}>
+                <span>{item.stage}</span>
+                <strong>{item.breaches}/{item.events}</strong>
+                <small>{(item.breachRate * 100).toFixed(1)}%</small>
+              </div>
+            ))}
+          </div>
+          <small className="historical-sla-source">Source: {workflow.historicalSla.source}</small>
+        </section>
+      )}
       <section className="workflow-board" aria-label="Loan applications by stage">
         {stages.map((stage) => {
           const stageLoans = loans.filter((loan) => loan.stage === stage)
@@ -1546,13 +1805,13 @@ function WorkflowMonitor({
                     <div className="workflow-card-top"><span>{loan.id}</span><MoreHorizontal size={16} /></div>
                     <strong>{loan.name}</strong>
                     <span className="workflow-card-amount">{money.format(loan.amount)} <i /> {loan.product}</span>
-                    <div className="workflow-owner"><div className={`mini-avatar ${loan.accent}`}>{loan.initials.slice(0, 1)}</div><span>{stage === 'Credit' ? loan.creditOfficer : loan.relationshipManager}</span></div>
-                    {loan.risk === 'High' ? (
-                      <span className="workflow-alert high-alert"><ShieldAlert size={13} /> Fraud review requested</span>
+                    <div className="workflow-owner"><div className={`mini-avatar ${loan.accent}`}>{loan.initials.slice(0, 1)}</div><span>{loan.workflow?.ownerName ?? (stage === 'Credit' ? loan.creditOfficer : loan.relationshipManager)}</span></div>
+                    {loan.workflow?.fraudHold !== 'none' ? (
+                      <span className="workflow-alert high-alert"><ShieldAlert size={13} /> Fraud hold {loan.workflow?.fraudHold}</span>
                     ) : loan.missingDocuments.length ? (
                       <span className="workflow-alert doc-alert"><FileText size={13} /> {loan.missingDocuments[0]}</span>
                     ) : (
-                      <span className="workflow-sla"><Clock3 size={12} /> {index === 0 ? 'Within SLA' : '6h in stage'}</span>
+                      <span className="workflow-sla"><Clock3 size={12} /> {loan.workflow ? `${loan.workflow.hoursInStage}h / ${loan.workflow.slaHours ?? '—'}h SLA` : index === 0 ? 'Within SLA' : '6h in stage'}</span>
                     )}
                   </button>
                 ))}
@@ -1562,21 +1821,54 @@ function WorkflowMonitor({
           )
         })}
       </section>
+      {workflow && (
+        <section className="panel pending-panel">
+          <div className="panel-heading">
+            <div><h2>SLA alerts</h2><p>Alerts and escalation notices generated from the simulation clock.</p></div>
+            <span className="results-count">{activeAlerts.length} unacknowledged</span>
+          </div>
+          {activeAlerts.length ? (
+            <div className="pending-decision-list">
+              {activeAlerts.map((alert) => {
+                const loan = loans.find((item) => item.workflow?.id === alert.deal_id)
+                return (
+                  <div key={alert.id} className="pending-decision-row">
+                    <div className="pending-avatar"><Clock3 size={16} /></div>
+                    <button className="alert-message" onClick={() => loan && onOpenLoan(loan.id)}>
+                      <strong>{alert.message}</strong>
+                      <span>Level {alert.level} · {alert.stage} · Routed to {alert.owner}</span>
+                    </button>
+                    {loan && (
+                      <button
+                        className="button button-secondary"
+                        onClick={() => onAction(loan, `acknowledge_alert:${alert.id}:${alert.ownerId}`)}
+                      >
+                        Acknowledge
+                      </button>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          ) : <div className="workflow-empty">No SLA alerts at the current simulation time.</div>}
+        </section>
+      )}
       <section className="panel pending-panel">
         <div className="panel-heading">
           <div><h2>Pending human decisions</h2><p>These steps cannot proceed without an authorized reviewer.</p></div>
           <button className="text-link" onClick={() => onNavigate('applications')}>Review queue <ArrowRight size={14} /></button>
         </div>
         <div className="pending-decision-list">
-          {stalled.slice(0, 4).map((loan) => (
+          {pending.slice(0, 8).map((loan) => (
             <button key={loan.id} className="pending-decision-row" onClick={() => onOpenLoan(loan.id)}>
               <div className="pending-avatar"><Users size={16} /></div>
               <div><strong>{loan.name}</strong><span>{loan.nextAction} · {loan.stage}</span></div>
-              <span className="pending-owner">{loan.stage === 'Credit' ? loan.creditOfficer : loan.relationshipManager}</span>
+              <span className="pending-owner">{loan.workflow?.ownerName ?? (loan.stage === 'Credit' ? loan.creditOfficer : loan.relationshipManager)}</span>
               <span className={`risk-pill risk-${riskTone[loan.risk]}`}>{loan.status}</span>
               <ChevronRight size={16} />
             </button>
           ))}
+          {!pending.length && <div className="workflow-empty">No human decisions are currently pending.</div>}
         </div>
       </section>
     </>
@@ -1594,17 +1886,41 @@ function LoanDrawer({
 }) {
   const [tab, setTab] = useState<DetailTab>('Overview')
   const isEquipment = loan.product.toLowerCase().includes('equipment')
-  const documents = [
-    ['Signed loan application', 'Received'],
-    ['Guarantor photo ID', 'Received'],
-    ['Certificate of formation', 'Received'],
-    ['IRS EIN letter', 'Received'],
-    ['Financial statements', 'Received'],
-    ['2025 tax return / extension', 'Received'],
-    ['Bank statements · May–October', loan.missingDocuments.some((item) => item.toLowerCase().includes('june')) ? 'Needs review' : 'Received'],
-    ...(isEquipment ? [['Equipment quote', loan.missingDocuments.includes('Equipment quote') ? 'Missing' : 'Received']] : []),
-    ['Borrower request letter', 'Received'],
-  ]
+  const workflow = loan.workflow
+  const documents = workflow
+    ? workflow.requiredDocuments.map((document) => ({
+        name: document.label,
+        status: document.status === 'received' ? 'Received' : 'Missing',
+        source: document.source,
+      }))
+    : [
+        { name: 'Signed loan application', status: 'Received', source: null },
+        { name: 'Guarantor photo ID', status: 'Received', source: null },
+        { name: 'Certificate of formation', status: 'Received', source: null },
+        { name: 'IRS EIN letter', status: 'Received', source: null },
+        { name: 'Financial statements', status: 'Received', source: null },
+        { name: '2025 tax return / extension', status: 'Received', source: null },
+        {
+          name: 'Bank statements · May–October',
+          status: loan.missingDocuments.some((item) => item.toLowerCase().includes('june'))
+            ? 'Needs review'
+            : 'Received',
+          source: null,
+        },
+        ...(isEquipment
+          ? [{
+              name: 'Equipment quote',
+              status: loan.missingDocuments.includes('Equipment quote') ? 'Missing' : 'Received',
+              source: null,
+            }]
+          : []),
+        { name: 'Borrower request letter', status: 'Received', source: null },
+      ]
+  const actionStages = ['Credit', 'Committee', 'Committed']
+  const humanGate = actionStages.includes(loan.stage)
+  const canAdvance = Boolean(
+    workflow && !workflow.blockers.length && !humanGate && loan.stage !== 'Closed',
+  )
 
   return (
     <div className="drawer-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
@@ -1626,32 +1942,73 @@ function LoanDrawer({
         <div className="drawer-content">
           {tab === 'Overview' && (
             <>
-              <div className="drawer-amount-card"><span>REQUESTED AMOUNT</span><strong>{money.format(loan.amount)}</strong><small>{loan.product} <i /> {loan.term} month term</small></div>
+              <div className="drawer-amount-card"><span>REQUESTED AMOUNT</span><strong>{workflow?.application.amountRaw?.value ?? money.format(loan.amount)}</strong><small>{loan.product} <i /> {workflow?.application.termRaw?.value ?? `${loan.term} month term`}</small></div>
               <div className="drawer-section"><div className="drawer-section-heading"><h3>Application details</h3><button><MoreHorizontal size={17} /></button></div>
-                <DetailRow label="Use of proceeds" value={loan.purpose} />
-                <DetailRow label="Industry" value={loan.industry} />
-                <DetailRow label="Stated annual revenue" value={money.format(loan.revenue)} />
+                <DetailRow label="Federal EIN" value={getApplicationValue(workflow?.application ?? {}, 'ein') || 'Not extracted'} source={workflow?.application.ein?.source} />
+                <DetailRow label="Business address" value={getApplicationValue(workflow?.application ?? {}, 'businessAddress') || 'Not extracted'} source={workflow?.application.businessAddress?.source} />
+                <DetailRow label="Guarantor" value={getApplicationValue(workflow?.application ?? {}, 'guarantor') || 'Not extracted'} source={workflow?.application.guarantor?.source} />
+                <DetailRow label="Use of proceeds" value={loan.purpose} source={workflow?.application.purpose?.source} />
+                <DetailRow label="Industry" value={loan.industry} source={workflow?.application.industry?.source} />
+                <DetailRow label="Stated annual revenue" value={workflow?.application.revenueRaw?.value ?? money.format(loan.revenue)} source={workflow?.application.revenueRaw?.source} />
                 <DetailRow label="Relationship manager" value={loan.relationshipManager} />
                 <DetailRow label="Credit officer" value={loan.creditOfficer} />
-                {loan.neededBy && <DetailRow label="Funds needed by" value={loan.neededBy} highlight />}
+                {loan.neededBy && <DetailRow label="Funds needed by" value={loan.neededBy} highlight source={workflow?.application.fundsNeededBy?.source} />}
               </div>
+              {workflow && (
+                <div className="drawer-section">
+                  <div className="drawer-section-heading"><h3>Workflow status</h3><span>{workflow.hoursInStage}h / {workflow.slaHours ?? '—'}h SLA</span></div>
+                  <DetailRow label="Assigned reviewer" value={`${workflow.ownerName} · ${workflow.team}`} />
+                  <DetailRow label="Fraud hold" value={workflow.fraudHold.replaceAll('_', ' ')} />
+                  <DetailRow label="Final fraud review" value={workflow.fraudReview} />
+                  {workflow.blockers.map((blocker) => (
+                    <div className="drawer-flag" key={blocker}><AlertCircle size={14} />{blocker}</div>
+                  ))}
+                </div>
+              )}
               <div className="drawer-section"><div className="drawer-section-heading"><h3>Next action</h3><span className="next-action-pill"><Clock3 size={12} /> Pending</span></div>
                 <div className="next-action-box"><AlertCircle size={16} /><span><strong>{loan.nextAction}</strong><small>{loan.flags[0] ?? 'Continue to the next required workflow step.'}</small></span></div>
               </div>
               {loan.flags.length > 0 && <div className="drawer-section"><div className="drawer-section-heading"><h3>Review notes</h3></div>{loan.flags.map((flag) => <div className="drawer-flag" key={flag}><AlertTriangle size={14} />{flag}</div>)}</div>}
+              {workflow?.checks.length ? (
+                <div className="drawer-section">
+                  <div className="drawer-section-heading"><h3>Known-rule checks</h3><span>Separate from cross-deal leads</span></div>
+                  {workflow.checks.map((check) => (
+                    <div className="workflow-check" key={check.code}>
+                      <strong>{check.code.replaceAll('_', ' ')}</strong>
+                      <span className={`check-status check-${check.status}`}>{check.status.replaceAll('_', ' ')}</span>
+                      <small>{check.evidence}</small>
+                      {loan.stage === 'Credit' && ['flagged', 'not_evaluable'].includes(check.status) && (
+                        <button className="text-link" onClick={() => onAction(`resolve_check:${check.code}`)}>
+                          Record human review
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  {workflow.creditMemo && <details className="credit-memo"><summary>System credit memo draft</summary><p>{workflow.creditMemo}</p></details>}
+                </div>
+              ) : null}
             </>
           )}
           {tab === 'Documents' && (
             <div className="drawer-section document-drawer-section">
               <div className="drawer-section-heading"><h3>Document checklist</h3><span>{loan.documents.received}/{loan.documents.required} received</span></div>
               <p className="drawer-section-subtitle">Requirements based on the Intake and Credit stage rules.</p>
-              {documents.map(([name, status]) => (
+              {documents.map(({ name, status, source }) => (
                 <div className="drawer-document-row" key={name}>
                   <div className={`document-status-icon ${status === 'Received' ? 'received' : status === 'Missing' ? 'missing' : 'review'}`}>
                     {status === 'Received' ? <FileCheck2 size={15} /> : <FileText size={15} />}
                   </div>
-                  <span>{name}</span>
+                  <span>{name}{source && <small className="document-source">{source}</small>}</span>
                   <small className={status === 'Received' ? 'doc-status-good' : 'doc-status-warn'}>{status}</small>
+                </div>
+              ))}
+              {workflow?.documents.map((document) => (
+                <div className="drawer-document-row" key={document.path}>
+                  <div className={`document-status-icon ${document.legible ? 'received' : 'review'}`}>
+                    {document.legible ? <FileCheck2 size={15} /> : <FileText size={15} />}
+                  </div>
+                  <span>{document.name}<small className="document-source">{document.path}</small></span>
+                  <small className={document.legible ? 'doc-status-good' : 'doc-status-warn'}>{document.legible ? 'Extracted' : 'Unreadable'}</small>
                 </div>
               ))}
             </div>
@@ -1660,29 +2017,72 @@ function LoanDrawer({
             <div className="drawer-section">
               <div className="drawer-section-heading"><h3>Application history</h3><span>SIM TIME</span></div>
               <div className="timeline">
-                <TimelineEvent icon={<Check size={13} />} title="Documents received" detail={`${loan.documents.received} of ${loan.documents.required} expected`} time="Today · 9:42 AM" />
-                <TimelineEvent icon={<Sparkles size={13} />} title="AI review completed" detail={`Risk score ${loan.riskScore}/100 · ${loan.risk.toLowerCase()} risk`} time="Today · 9:36 AM" />
-                <TimelineEvent icon={<FileText size={13} />} title="Application entered ${loan.stage}" detail={loan.nextAction} time="Today · 9:12 AM" />
-                <TimelineEvent icon={<BriefcaseBusiness size={13} />} title="Application created" detail={`${loan.relationshipManager} assigned as relationship manager`} time="Nov 2 · 9:21 AM" />
+                {workflow?.history.length ? workflow.history.map((event) => (
+                  <TimelineEvent
+                    key={`${event.event_type}-${event.created_at}`}
+                    icon={<Activity size={13} />}
+                    title={event.event_type.replaceAll('_', ' ')}
+                    detail={`${event.detail} · ${event.actor}`}
+                    time={new Intl.DateTimeFormat('en-US', {
+                      dateStyle: 'medium',
+                      timeStyle: 'short',
+                      timeZone: 'America/Chicago',
+                    }).format(new Date(event.created_at))}
+                  />
+                )) : (
+                  <>
+                    <TimelineEvent icon={<Check size={13} />} title="Documents extracted" detail={`${loan.documents.received} of ${loan.documents.required} required items received`} time="Current simulation" />
+                    <TimelineEvent icon={<BriefcaseBusiness size={13} />} title={`Application in ${loan.stage}`} detail={loan.nextAction} time={workflow?.stageEnteredAt ?? 'Initial state'} />
+                  </>
+                )}
               </div>
             </div>
           )}
         </div>
         <div className="drawer-footer">
-          {loan.risk === 'High' ? (
-            <button className="button button-danger drawer-main-action" onClick={() => onAction('Request fraud hold')}><ShieldAlert size={15} /> Request fraud hold</button>
-          ) : (
-            <button className="button button-primary drawer-main-action" onClick={() => onAction('Approve')}><Check size={15} /> Record review decision</button>
+          {workflow && (
+            <>
+              {humanGate && (
+                <>
+                  <button className="button button-primary drawer-main-action" onClick={() => onAction('Approve')}><Check size={15} /> Approve &amp; advance</button>
+                  <button className="button button-secondary" onClick={() => onAction('decline')}>Decline</button>
+                </>
+              )}
+              {loan.stage === 'Product' && (
+                <>
+                  {!workflow.productConfigured && <button className="button button-primary drawer-main-action" onClick={() => onAction('configure_product')}>Confirm product &amp; pricing</button>}
+                  {isEquipment && !workflow.vendorVerified && <button className="button button-secondary" onClick={() => onAction('verify_vendor')}>Record vendor verification</button>}
+                </>
+              )}
+              {loan.stage === 'Closed' && (
+                <>
+                  {workflow.status !== 'closed' && workflow.fraudHold === 'requested' && <button className="button button-danger drawer-main-action" onClick={() => onAction('place_hold')}>Place fraud hold</button>}
+                  {workflow.status !== 'closed' && workflow.fraudHold === 'placed' && <button className="button button-secondary" onClick={() => onAction('release_hold')}>Release fraud hold</button>}
+                  {!workflow.disbursementVerified && <button className="button button-secondary" onClick={() => onAction('verify_disbursement')}>Verify disbursement account</button>}
+                  <button className="button button-primary drawer-main-action" disabled={workflow.status === 'closed' || workflow.blockers.length > 0} onClick={() => onAction('release_funds')}>Release funds</button>
+                </>
+              )}
+              {['Committed', 'Closed'].includes(loan.stage) && workflow.status !== 'closed' && workflow.fraudReview !== 'cleared' && workflow.fraudHold !== 'placed' && (
+                <button className="button button-secondary" onClick={() => onAction('clear_fraud')}>Clear final fraud review</button>
+              )}
+              {!humanGate && loan.stage !== 'Closed' && (
+                <button className="button button-primary drawer-main-action" disabled={!canAdvance} onClick={() => onAction('advance')}>Advance to next stage</button>
+              )}
+              {workflow.fraudHold === 'requested' && loan.stage !== 'Closed' && <button className="button button-danger" onClick={() => onAction('place_hold')}>Place fraud hold</button>}
+              {workflow.fraudHold === 'placed' && loan.stage !== 'Closed' && <button className="button button-secondary" onClick={() => onAction('release_hold')}>Release fraud hold</button>}
+              {workflow.status !== 'closed' && workflow.fraudHold === 'none' && <button className="button button-danger" onClick={() => onAction('Request fraud hold')}><ShieldAlert size={15} /> Request fraud hold</button>}
+              <button className="button button-secondary drawer-secondary-action" onClick={() => onAction('Request information')}><Send size={15} /> Request info</button>
+            </>
           )}
-          <button className="button button-secondary drawer-secondary-action" onClick={() => onAction('Request information')}><Send size={15} /> Request info</button>
+          {!workflow && <p className="human-gate-note">Connect to the workflow service to record auditable application actions.</p>}
         </div>
       </aside>
     </div>
   )
 }
 
-function DetailRow({ label, value, highlight = false }: { label: string; value: string; highlight?: boolean }) {
-  return <div className={`detail-row ${highlight ? 'detail-row-highlight' : ''}`}><span>{label}</span><strong>{value}</strong></div>
+function DetailRow({ label, value, highlight = false, source }: { label: string; value: string; highlight?: boolean; source?: string }) {
+  return <div className={`detail-row ${highlight ? 'detail-row-highlight' : ''}`}><span>{label}</span><strong>{value}{source && <small className="document-source">{source}</small>}</strong></div>
 }
 
 function TimelineEvent({ icon, title, detail, time }: { icon: ReactNode; title: string; detail: string; time: string }) {

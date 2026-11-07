@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
-import type { ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import type { FormEvent, ReactNode } from 'react'
 import {
   Activity,
   AlertCircle,
@@ -60,6 +60,8 @@ type Signal = CrossDealSignal & {
   loanIds: string[]
   reviewIndex: number
 }
+type ActionForm = { note: string; product?: string; pricing?: string }
+type PendingAction = { loan: Loan; actionLabel: string; action: string }
 
 const money = new Intl.NumberFormat('en-US', {
   style: 'currency',
@@ -153,6 +155,8 @@ function App() {
   const [analysisRefreshing, setAnalysisRefreshing] = useState(false)
   const [workflow, setWorkflow] = useState<WorkflowSnapshot | null>(null)
   const [workflowError, setWorkflowError] = useState('')
+  const [pendingAction, setPendingAction] = useState<PendingAction | null>(null)
+  const cancelPendingAction = useCallback(() => setPendingAction(null), [])
 
   const loans = useMemo(() => {
     if (!workflow) return initialLoans
@@ -347,7 +351,7 @@ function App() {
     window.setTimeout(() => setToast(''), 3200)
   }
 
-  const handleAction = async (loan: Loan, actionLabel: string) => {
+  const handleAction = async (loan: Loan, actionLabel: string, form?: ActionForm) => {
     const item = loan.workflow
     if (!item) {
       notify('Connect to the workflow service before recording a decision.')
@@ -380,41 +384,30 @@ function App() {
       action = 'resolve_check'
       checkCode = checkResolution[1]
     }
-    let note = ''
-    let product = ''
-    let pricing = ''
+    let note = form?.note ?? ''
+    let product = form?.product ?? ''
+    let pricing = form?.pricing ?? ''
     if (['approve', 'decline', 'request_info', 'request_hold', 'escalate', 'place_hold', 'release_hold', 'clear_fraud', 'verify_vendor', 'verify_disbursement', 'resolve_check', 'release_funds'].includes(action)) {
-      const prompts: Record<string, string> = {
-        approve: 'Rationale for approving and advancing this application',
-        decline: 'Reason for declining this application',
-        request_info: 'Specify the information needed from the borrower',
-        request_hold: 'Supporting evidence and rationale for requesting a human fraud hold review',
-        escalate: 'Reason for escalating this application',
-        place_hold: 'Evidence and rationale for placing a fraud hold',
-        release_hold: 'Rationale for releasing the fraud hold',
-        clear_fraud: 'Evidence and rationale for clearing the final fraud review',
-        verify_vendor: 'How were the vendor identity and remittance account independently verified?',
-        verify_disbursement: 'How was the disbursement account independently verified?',
-        resolve_check: 'Record the human review rationale. This does not change the automated check result.',
-        release_funds: 'Rationale for authorizing this funding release',
+      if (!form) {
+        setPendingAction({ loan, actionLabel, action })
+        return
       }
-      const response = window.prompt(prompts[action])
-      if (response === null) return
-      note = response.trim()
+      note = note.trim()
       if (!note) {
         notify('A rationale is required for this workflow action.')
         return
       }
     } else if (action === 'configure_product') {
-      const selectedProduct = window.prompt(
-        'Confirmed loan product',
-        getApplicationValue(item.application, 'product'),
-      )
-      if (selectedProduct === null) return
-      const selectedPricing = window.prompt('Confirmed pricing and term')
-      if (selectedPricing === null) return
-      product = selectedProduct.trim()
-      pricing = selectedPricing.trim()
+      if (!form) {
+        setPendingAction({ loan, actionLabel, action })
+        return
+      }
+      product = product.trim()
+      pricing = pricing.trim()
+      if (!product || !pricing) {
+        notify('Enter both the loan product and pricing details.')
+        return
+      }
     }
     const fraudOperationsAction = ['place_hold', 'release_hold', 'clear_fraud'].includes(action)
     const actor = alertOwner || (fraudOperationsAction ? 'victor.hale' : item.requiredActor)
@@ -502,7 +495,7 @@ function App() {
         </div>
 
         <nav className="primary-nav" aria-label="Main navigation">
-          {(['WORKSPACE', 'INTELLIGENCE', 'OPERATIONS'] as const).map(
+          {(['WORKSPACE', 'REVIEW & FOLLOW-UP'] as const).map(
             (group) => (
               <div className="nav-group" key={group}>
                 <p className="nav-group-label">{group}</p>
@@ -527,9 +520,6 @@ function App() {
                       >
                         <Icon size={17} strokeWidth={1.8} />
                         <span>{item.label}</span>
-                        {'badge' in item && item.badge ? (
-                          <span className="nav-badge">{item.badge}</span>
-                        ) : null}
                       </button>
                     )
                   })}
@@ -571,7 +561,7 @@ function App() {
           <div className="topbar-actions">
             <div className="sim-clock">
               <span className={`clock-live-dot ${workflow ? '' : 'clock-offline'}`} />
-              <span>SIM</span>
+              <span>Demo time</span>
               <strong>{simulationDate}</strong>
               <span className="clock-divider" />
               <strong>{simulationTime}</strong>
@@ -582,7 +572,7 @@ function App() {
                 disabled={!workflow}
                 onClick={() => void advanceClock()}
               >
-                +1h
+                Next hour
               </button>
             </div>
             <button
@@ -673,6 +663,18 @@ function App() {
           onAction={(action) => handleAction(selectedLoan, action)}
         />
       )}
+      {pendingAction && (
+        <ActionDialog
+          loan={pendingAction.loan}
+          action={pendingAction.action}
+          actionLabel={pendingAction.actionLabel}
+          onCancel={cancelPendingAction}
+          onSubmit={(form) => {
+            setPendingAction(null)
+            void handleAction(pendingAction.loan, pendingAction.actionLabel, form)
+          }}
+        />
+      )}
       {mobileNavOpen && (
         <button
           className="mobile-backdrop"
@@ -709,6 +711,163 @@ function PageHeading({
         <p className="page-subtitle">{subtitle}</p>
       </div>
       {children && <div className="heading-actions">{children}</div>}
+    </div>
+  )
+}
+
+function ActionDialog({
+  loan,
+  action,
+  actionLabel,
+  onCancel,
+  onSubmit,
+}: {
+  loan: Loan
+  action: string
+  actionLabel: string
+  onCancel: () => void
+  onSubmit: (form: ActionForm) => void
+}) {
+  const isProductSetup = action === 'configure_product'
+  const [note, setNote] = useState('')
+  const [product, setProduct] = useState(
+    getApplicationValue(loan.workflow?.application ?? {}, 'product'),
+  )
+  const [pricing, setPricing] = useState(
+    getApplicationValue(loan.workflow?.application ?? {}, 'term') ||
+      `${loan.term} month term`,
+  )
+  const copy: Record<string, { title: string; description: string }> = {
+    approve: {
+      title: 'Approve this application',
+      description: 'Explain the decision. This records your approval and advances the application.',
+    },
+    decline: {
+      title: 'Decline this application',
+      description: 'Record the reason for the decision.',
+    },
+    request_info: {
+      title: 'Request information',
+      description: 'List what is missing. This records the request; it does not send a message automatically.',
+    },
+    request_hold: {
+      title: 'Request a fraud review',
+      description: 'Describe what should be reviewed. This asks Fraud Operations to consider a hold; it does not place one.',
+    },
+    escalate: {
+      title: 'Escalate this application',
+      description: 'Explain why another reviewer should take a look.',
+    },
+    place_hold: {
+      title: 'Place a funding hold',
+      description: 'A hold pauses funding while the concern is reviewed. Record the evidence and reason.',
+    },
+    release_hold: {
+      title: 'Release the funding hold',
+      description: 'Record why it is appropriate to continue.',
+    },
+    clear_fraud: {
+      title: 'Complete the fraud review',
+      description: 'Record the evidence supporting the final review decision.',
+    },
+    verify_vendor: {
+      title: 'Record vendor verification',
+      description: 'Describe how the vendor and payment details were checked independently.',
+    },
+    verify_disbursement: {
+      title: 'Verify the payment account',
+      description: 'Describe how the account receiving the funds was checked independently.',
+    },
+    resolve_check: {
+      title: 'Record your review',
+      description: 'Add your review notes. This does not change the automated check result.',
+    },
+    release_funds: {
+      title: 'Authorize funding',
+      description: 'Record why it is appropriate to release the funds.',
+    },
+    configure_product: {
+      title: 'Confirm loan details',
+      description: 'Check the loan product and pricing before saving them.',
+    },
+  }
+  const actionCopy = copy[action] ?? {
+    title: actionLabel,
+    description: 'Add a note explaining this action.',
+  }
+
+  useEffect(() => {
+    const previousFocus = document.activeElement
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onCancel()
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown)
+      if (previousFocus instanceof HTMLElement) previousFocus.focus()
+    }
+  }, [onCancel])
+
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    onSubmit({ note: note.trim(), product: product.trim(), pricing: pricing.trim() })
+  }
+
+  return (
+    <div
+      className="action-dialog-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onCancel()
+      }}
+    >
+      <section
+        className="action-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="action-dialog-title"
+        aria-describedby="action-dialog-description"
+      >
+        <div className="action-dialog-heading">
+          <div>
+            <p className="eyebrow">{loan.name} · {loan.id}</p>
+            <h2 id="action-dialog-title">{actionCopy.title}</h2>
+          </div>
+          <button className="icon-button" aria-label="Close" onClick={onCancel}><X size={19} /></button>
+        </div>
+        <p id="action-dialog-description" className="action-dialog-description">{actionCopy.description}</p>
+        <form onSubmit={submit}>
+          {isProductSetup ? (
+            <div className="action-dialog-fields">
+              <label>
+                Loan product
+                <input autoFocus required value={product} onChange={(event) => setProduct(event.target.value)} />
+              </label>
+              <label>
+                Pricing and term
+                <input required value={pricing} onChange={(event) => setPricing(event.target.value)} />
+              </label>
+            </div>
+          ) : (
+            <label>
+              Your notes <span className="required-label">(required)</span>
+              <textarea
+                autoFocus
+                required
+                rows={4}
+                value={note}
+                onChange={(event) => setNote(event.target.value)}
+                placeholder="Write a short explanation..."
+              />
+            </label>
+          )}
+          <div className="action-dialog-footer">
+            <button type="button" className="button button-secondary" onClick={onCancel}>Cancel</button>
+            <button type="submit" className="button button-primary">
+              {isProductSetup ? 'Save loan details' : 'Record action'}
+            </button>
+          </div>
+        </form>
+      </section>
     </div>
   )
 }
@@ -775,6 +934,33 @@ function Dashboard({
         <span className="demo-banner-right">{workflow ? 'LIVE WORKFLOW' : 'OFFLINE DEMO'} <span>·</span> {loans.length} APPLICATIONS</span>
       </div>
 
+      <section className="getting-started" aria-labelledby="getting-started-title">
+        <div className="getting-started-heading">
+          <div>
+            <p className="eyebrow">A SIMPLE PLACE TO START</p>
+            <h2 id="getting-started-title">What would you like to do?</h2>
+            <p>Open a loan, review anything that needs attention, or see where work is waiting.</p>
+          </div>
+        </div>
+        <div className="getting-started-actions">
+          <button onClick={() => onNavigate('applications')}>
+            <span className="guide-number">1</span>
+            <span><strong>Find an application</strong><small>Search the list of businesses and loans</small></span>
+            <ChevronRight size={18} />
+          </button>
+          <button onClick={() => onNavigate('fraud')}>
+            <span className="guide-number">2</span>
+            <span><strong>Review alerts</strong><small>See items that may need a closer look</small></span>
+            <ChevronRight size={18} />
+          </button>
+          <button onClick={() => onNavigate('workflow')}>
+            <span className="guide-number">3</span>
+            <span><strong>Check loan progress</strong><small>See what is waiting and who should act</small></span>
+            <ChevronRight size={18} />
+          </button>
+        </div>
+      </section>
+
       <section className="metric-grid" aria-label="Portfolio overview">
         <MetricCard
           label="Active applications"
@@ -784,24 +970,24 @@ function Dashboard({
           tone="blue"
         />
         <MetricCard
-          label="Pending approvals"
+          label="Waiting for a decision"
           value={String(pending)}
           note="Awaiting a decision"
           delta="2 need attention"
           tone="blue"
         />
         <MetricCard
-          label="Fraud alerts"
+          label="Items to review"
           value={String(flagged)}
-          note="Known checks and cross-deal leads"
-          delta="Requires human review"
+          note="Alerts are leads, not proof of fraud"
+          delta="Needs a person's review"
           tone="rose"
         />
         <MetricCard
-          label="Overdue / at risk"
+          label="Late tasks"
           value={String(overdue)}
-          note="SLA alerts from simulation clock"
-          delta={overdue ? 'Review escalations' : 'No SLA alerts'}
+          note="Based on the demo clock"
+          delta={overdue ? 'Open loan progress' : 'No late tasks'}
           tone="amber"
         />
       </section>
@@ -924,7 +1110,7 @@ function Dashboard({
             ))}
           </div>
           <button className="full-width-link" onClick={() => onNavigate('workflow')}>
-            Open workflow monitor <ArrowRight size={14} />
+            See loan progress <ArrowRight size={14} />
           </button>
         </div>
       </section>
@@ -1206,9 +1392,9 @@ function FraudCenter({
   return (
     <>
       <PageHeading
-        eyebrow="INTELLIGENCE"
-        title="Fraud intelligence"
-        subtitle="Evidence-linked cross-deal leads for analyst review. No signal is a fraud finding."
+        eyebrow="REVIEW & FOLLOW-UP"
+        title="Fraud checks"
+        subtitle="Automated checks and patterns across applications offer leads, not proof. Review the evidence before taking action."
       >
         <button className="button button-secondary" onClick={onRefresh} disabled={analysisRefreshing}>
           <Activity size={15} /> {analysisRefreshing ? 'Recalculating…' : 'Recalculate'}
@@ -1286,7 +1472,7 @@ function FraudCenter({
               })}
             </div>
             <div className="history-baseline">
-              <span>Historical SLA breaches</span>
+              <span>Steps that took longer than expected</span>
               <strong>{historicalReference.slaBreaches} / {historicalReference.stageEvents}</strong>
               <div className="history-baseline-track">
                 <i style={{ width: `${(historicalReference.slaBreaches / historicalReference.stageEvents) * 100}%` }} />
@@ -1557,7 +1743,7 @@ function NetworkExplorer({
   if (!analysis || !activeNode) {
     return (
       <>
-        <PageHeading eyebrow="INTELLIGENCE" title="Relationship network" subtitle="Source-backed links appear when the analysis service is running." />
+        <PageHeading eyebrow="REVIEW & FOLLOW-UP" title="Connections between applications" subtitle="Links supported by documents and past loan records appear here." />
         <div className="network-disclaimer"><AlertTriangle size={15} /><span>Analysis unavailable. Start the backend service to load evidence-linked relationships.</span></div>
       </>
     )
@@ -1566,9 +1752,9 @@ function NetworkExplorer({
   return (
     <>
       <PageHeading
-        eyebrow="INTELLIGENCE"
-        title="Relationship network"
-        subtitle="Explore document- and history-backed links. Select a node to inspect its evidence."
+        eyebrow="REVIEW & FOLLOW-UP"
+        title="Connections between applications"
+        subtitle="Select a business or shared record to see how applications may be connected."
       >
         <button className="button button-secondary" onClick={() => setShowAllLinks((value) => !value)}>
           <GitBranch size={16} />
@@ -1753,37 +1939,37 @@ function WorkflowMonitor({
   return (
     <>
       <PageHeading
-        eyebrow="OPERATIONS"
-        title="Workflow monitor"
-        subtitle="Track stage ownership, pending human decisions, and service-level commitments."
+        eyebrow="REVIEW & FOLLOW-UP"
+        title="Loan progress"
+        subtitle="See where each application is, who needs to act, and when a task may be late."
       >
         <button className="button button-secondary" onClick={() => onNavigate('applications')}>
           <ListFilter size={16} /> View applications
         </button>
-        <div className="live-status"><span /> SIM CLOCK ACTIVE</div>
+        <div className="live-status"><span /> DEMO CLOCK ACTIVE</div>
       </PageHeading>
-      <div className="demo-banner"><Clock3 size={15} /><span>Stage SLAs use the challenge simulation clock. Advancing time creates persisted, owner-routed alerts. Reviewer IDs are simulated; this demo does not authenticate users or send notifications.</span></div>
+      <div className="demo-banner"><Clock3 size={15} /><span>This demo uses a pretend clock. Choose “Next hour” to see how reminders work. No real notifications are sent.</span></div>
       <section className="workflow-stats">
-        <div><span>On track</span><strong>{onTrack}</strong><i className="stat-green"><ArrowUpRight size={13} /> Under 75% SLA</i></div>
-        <div><span>Approaching SLA</span><strong>{approaching}</strong><i className="stat-amber"><Clock3 size={13} /> Alert at 100%</i></div>
-        <div><span>Escalations due</span><strong>{escalatedDeals}</strong><i className="stat-rose"><ArrowUpRight size={13} /> At 150% SLA</i></div>
-        <div><span>Human decisions</span><strong>{pending.length}</strong><i className="stat-blue"><Users size={13} /> Awaiting response</i></div>
+        <div><span>Within expected time</span><strong>{onTrack}</strong><i className="stat-green"><ArrowUpRight size={13} /> Less than 75% of time limit</i></div>
+        <div><span>Nearly late</span><strong>{approaching}</strong><i className="stat-amber"><Clock3 size={13} /> Reminder when time is up</i></div>
+        <div><span>Past the time limit</span><strong>{escalatedDeals}</strong><i className="stat-rose"><ArrowUpRight size={13} /> Needs follow-up</i></div>
+        <div><span>Waiting for a person</span><strong>{pending.length}</strong><i className="stat-blue"><Users size={13} /> A reviewer must act</i></div>
       </section>
       {workflow?.historicalSla.available && (
         <section className="panel historical-sla-panel">
           <div className="panel-heading">
             <div>
-              <h2>Historical SLA baseline</h2>
-              <p>Completed stage events in the challenge dataset · operational context, not fraud evidence</p>
+              <h2>How long past steps took</h2>
+              <p>Challenge records show how often a step took longer than expected. This is not evidence of fraud.</p>
             </div>
-            <strong>{workflow.historicalSla.breaches} / {workflow.historicalSla.events} <span>({((workflow.historicalSla.breachRate ?? 0) * 100).toFixed(1)}%)</span></strong>
+            <strong>{workflow.historicalSla.breaches} of {workflow.historicalSla.events} <span>steps took longer than expected</span></strong>
           </div>
           <div className="historical-sla-grid">
             {workflow.historicalSla.byStage.map((item) => (
               <div key={item.stage}>
                 <span>{item.stage}</span>
-                <strong>{item.breaches}/{item.events}</strong>
-                <small>{(item.breachRate * 100).toFixed(1)}%</small>
+                <strong>{item.breaches} of {item.events}</strong>
+                <small>{(item.breachRate * 100).toFixed(1)}% took longer</small>
               </div>
             ))}
           </div>
@@ -1791,6 +1977,7 @@ function WorkflowMonitor({
         </section>
       )}
       <section className="workflow-board" aria-label="Loan applications by stage">
+        <p className="workflow-board-help">Each column is a step in the loan process. Select an application to see what to do next.</p>
         {stages.map((stage) => {
           const stageLoans = loans.filter((loan) => loan.stage === stage)
           return (
@@ -1811,7 +1998,7 @@ function WorkflowMonitor({
                     ) : loan.missingDocuments.length ? (
                       <span className="workflow-alert doc-alert"><FileText size={13} /> {loan.missingDocuments[0]}</span>
                     ) : (
-                      <span className="workflow-sla"><Clock3 size={12} /> {loan.workflow ? `${loan.workflow.hoursInStage}h / ${loan.workflow.slaHours ?? '—'}h SLA` : index === 0 ? 'Within SLA' : '6h in stage'}</span>
+                      <span className="workflow-sla"><Clock3 size={12} /> {loan.workflow ? `${loan.workflow.hoursInStage}h of ${loan.workflow.slaHours ?? '—'}h limit` : index === 0 ? 'Within time limit' : '6h in stage'}</span>
                     )}
                   </button>
                 ))}
@@ -1824,7 +2011,7 @@ function WorkflowMonitor({
       {workflow && (
         <section className="panel pending-panel">
           <div className="panel-heading">
-            <div><h2>SLA alerts</h2><p>Alerts and escalation notices generated from the simulation clock.</p></div>
+            <div><h2>Time-limit reminders</h2><p>Reminders created when a loan step has taken longer than expected.</p></div>
             <span className="results-count">{activeAlerts.length} unacknowledged</span>
           </div>
           {activeAlerts.length ? (
@@ -1850,7 +2037,7 @@ function WorkflowMonitor({
                 )
               })}
             </div>
-          ) : <div className="workflow-empty">No SLA alerts at the current simulation time.</div>}
+          ) : <div className="workflow-empty">No time-limit reminders right now.</div>}
         </section>
       )}
       <section className="panel pending-panel">
@@ -1943,6 +2130,19 @@ function LoanDrawer({
           {tab === 'Overview' && (
             <>
               <div className="drawer-amount-card"><span>REQUESTED AMOUNT</span><strong>{workflow?.application.amountRaw?.value ?? money.format(loan.amount)}</strong><small>{loan.product} <i /> {workflow?.application.termRaw?.value ?? `${loan.term} month term`}</small></div>
+              <section className="drawer-next-step" aria-label="What to do next">
+                <span>WHAT TO DO NEXT</span>
+                <strong>{loan.nextAction}</strong>
+                <p>
+                  {workflow?.blockers.length
+                    ? `First, take care of: ${workflow.blockers.join('; ')}`
+                    : humanGate
+                      ? 'A reviewer needs to make a decision before this loan can move forward.'
+                      : workflow
+                        ? 'Use the action buttons below when you are ready. The system will explain if something is still needed.'
+                        : 'Connect to the workflow service to see the next step for this application.'}
+                </p>
+              </section>
               <div className="drawer-section"><div className="drawer-section-heading"><h3>Application details</h3><button><MoreHorizontal size={17} /></button></div>
                 <DetailRow label="Federal EIN" value={getApplicationValue(workflow?.application ?? {}, 'ein') || 'Not extracted'} source={workflow?.application.ein?.source} />
                 <DetailRow label="Business address" value={getApplicationValue(workflow?.application ?? {}, 'businessAddress') || 'Not extracted'} source={workflow?.application.businessAddress?.source} />
@@ -1956,7 +2156,7 @@ function LoanDrawer({
               </div>
               {workflow && (
                 <div className="drawer-section">
-                  <div className="drawer-section-heading"><h3>Workflow status</h3><span>{workflow.hoursInStage}h / {workflow.slaHours ?? '—'}h SLA</span></div>
+                  <div className="drawer-section-heading"><h3>Loan status</h3><span>{workflow.hoursInStage}h in this step · {workflow.slaHours ?? '—'}h time limit</span></div>
                   <DetailRow label="Assigned reviewer" value={`${workflow.ownerName} · ${workflow.team}`} />
                   <DetailRow label="Fraud hold" value={workflow.fraudHold.replaceAll('_', ' ')} />
                   <DetailRow label="Final fraud review" value={workflow.fraudReview} />

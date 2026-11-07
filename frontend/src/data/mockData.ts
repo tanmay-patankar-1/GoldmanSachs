@@ -467,7 +467,7 @@ export const activityItems = [
 export const navItems = [
   { id: 'overview', label: 'Overview', group: 'WORKSPACE' },
   { id: 'applications', label: 'Applications', group: 'WORKSPACE' },
-  { id: 'fraud', label: 'Fraud intelligence', group: 'INTELLIGENCE', badge: '3' },
-  { id: 'network', label: 'Relationship network', group: 'INTELLIGENCE' },
-  { id: 'workflow', label: 'Workflow monitor', group: 'OPERATIONS' },
+  { id: 'fraud', label: 'Fraud checks', group: 'REVIEW & FOLLOW-UP' },
+  { id: 'network', label: 'Connections', group: 'REVIEW & FOLLOW-UP' },
+  { id: 'workflow', label: 'Loan progress', group: 'REVIEW & FOLLOW-UP' },
 ] as const

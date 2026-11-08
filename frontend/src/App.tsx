@@ -14,6 +14,7 @@ import {
   ChevronDown,
   ChevronRight,
   Clock3,
+  Download,
   FileCheck2,
   FileText,
   Fingerprint,
@@ -25,6 +26,7 @@ import {
   Menu,
   MoreHorizontal,
   Network,
+  LogOut,
   Search,
   Send,
   Shield,
@@ -48,13 +50,19 @@ import {
   fetchWorkflow,
   fetchFraudAnalysis,
   postWorkflowAction,
+  recordApplicationAccess,
+  downloadApplicationDocument,
   type CrossDealSignal,
   type FraudAnalysis,
   type WorkflowSnapshot,
 } from './data/fraudApi'
+import Auth from './Auth'
+import { AuditLog, HistoricalRecords, UserManagement } from './Security'
+import { getCurrentEmployee, logout } from './data/authApi'
+import type { Employee } from './data/authApi'
 import './App.css'
 
-type ViewId = (typeof navItems)[number]['id']
+type ViewId = (typeof navItems)[number]['id'] | 'audit' | 'history' | 'users'
 type DetailTab = 'Overview' | 'Documents' | 'Activity'
 type Signal = CrossDealSignal & {
   loanIds: string[]
@@ -140,7 +148,78 @@ const riskTone: Record<RiskLevel, string> = {
 }
 
 function App() {
-  const [view, setView] = useState<ViewId>('overview')
+  const [employee, setEmployee] = useState<Employee | null>(null)
+  const [sessionLoading, setSessionLoading] = useState(true)
+  const [sessionError, setSessionError] = useState('')
+
+  useEffect(() => {
+    let active = true
+    const expireSession = () => {
+      if (active) setEmployee(null)
+    }
+    window.addEventListener('dealpilot:unauthorized', expireSession)
+    void getCurrentEmployee()
+      .then((user) => {
+        if (active) setEmployee(user)
+      })
+      .catch((error: unknown) => {
+        if (active) setSessionError(error instanceof Error ? error.message : 'Unable to verify your session.')
+      })
+      .finally(() => {
+        if (active) setSessionLoading(false)
+      })
+    return () => {
+      active = false
+      window.removeEventListener('dealpilot:unauthorized', expireSession)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!employee) return
+    const timer = window.setInterval(() => {
+      void getCurrentEmployee()
+        .then((current) => {
+          if (!current || current.id !== employee.id || current.role !== employee.role) {
+            setEmployee(null)
+          }
+        })
+        .catch((error: unknown) => {
+          setSessionError(error instanceof Error ? error.message : 'Session verification failed.')
+          setEmployee(null)
+        })
+    }, 60_000)
+    return () => window.clearInterval(timer)
+  }, [employee])
+
+  const signOut = async () => {
+    try {
+      await logout()
+      setEmployee(null)
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : 'Unable to sign out.')
+    }
+  }
+
+  if (sessionLoading) {
+    return <main className="auth-page"><p role="status">Checking your DealPilot session...</p></main>
+  }
+  if (!employee) {
+    return <Auth onAuthenticated={setEmployee} initialMessage={sessionError} />
+  }
+  return <DealPilotApp employee={employee} onLogout={() => void signOut()} />
+}
+
+function DealPilotApp({
+  employee,
+  onLogout,
+}: {
+  employee: Employee
+  onLogout: () => void
+}) {
+  const [view, setView] = useState<ViewId>(
+    employee.role === 'Auditor' ? 'audit' :
+      employee.role === 'Fraud Investigator' ? 'fraud' : 'overview',
+  )
   const [selectedLoanId, setSelectedLoanId] = useState<string | null>(null)
   const [selectedSignalId, setSelectedSignalId] = useState('')
   const [search, setSearch] = useState('')
@@ -151,7 +230,9 @@ function App() {
   const [networkFocusId, setNetworkFocusId] = useState('DP-26019')
   const [fraudAnalysis, setFraudAnalysis] = useState<FraudAnalysis | null>(null)
   const [analysisError, setAnalysisError] = useState('')
-  const [analysisLoading, setAnalysisLoading] = useState(true)
+  const [analysisLoading, setAnalysisLoading] = useState(
+    employee.role === 'Admin' || employee.role === 'Fraud Investigator',
+  )
   const [analysisRefreshing, setAnalysisRefreshing] = useState(false)
   const [workflow, setWorkflow] = useState<WorkflowSnapshot | null>(null)
   const [workflowError, setWorkflowError] = useState('')
@@ -264,6 +345,7 @@ function App() {
   }
 
   useEffect(() => {
+    if (!['Admin', 'Fraud Investigator'].includes(employee.role)) return
     let active = true
     void fetchFraudAnalysis()
       .then((result) => {
@@ -282,9 +364,10 @@ function App() {
     return () => {
       active = false
     }
-  }, [])
+  }, [employee.role])
 
   useEffect(() => {
+    if (!['Admin', 'Loan Officer', 'Underwriter', 'Fraud Investigator'].includes(employee.role)) return
     let active = true
     void fetchWorkflow()
       .then((result) => {
@@ -301,7 +384,7 @@ function App() {
     return () => {
       active = false
     }
-  }, [])
+  }, [employee.role])
 
   const signals: Signal[] = useMemo(() => {
     if (!fraudAnalysis) return []
@@ -365,13 +448,11 @@ function App() {
       'Mark reviewed': 'mark_reviewed',
     } as Record<string, string>)[actionLabel] ?? actionLabel
     let alertId = ''
-    let alertOwner = ''
     let checkCode = ''
-    const alertAcknowledgement = action.match(/^acknowledge_alert:(\d+):([^:]+)$/)
+    const alertAcknowledgement = action.match(/^acknowledge_alert:(\d+):[^:]+$/)
     if (alertAcknowledgement) {
       action = 'acknowledge_alert'
       alertId = alertAcknowledgement[1]
-      alertOwner = alertAcknowledgement[2]
     } else {
       const alertIdOnly = action.match(/^acknowledge_alert:(\d+)$/)
       if (alertIdOnly) {
@@ -409,10 +490,8 @@ function App() {
         return
       }
     }
-    const fraudOperationsAction = ['place_hold', 'release_hold', 'clear_fraud'].includes(action)
-    const actor = alertOwner || (fraudOperationsAction ? 'victor.hale' : item.requiredActor)
     try {
-      const payload: Record<string, string> = { action, actor }
+      const payload: Record<string, string> = { action }
       if (note) payload.note = note
       if (product) payload.product = product
       if (pricing) payload.pricing = pricing
@@ -463,6 +542,40 @@ function App() {
     setSelectedLoanId(null)
   }
 
+  const canAccessLoans = ['Admin', 'Loan Officer', 'Underwriter'].includes(employee.role)
+  const canAccessFraud = ['Admin', 'Fraud Investigator'].includes(employee.role)
+  const canAccessAudit = ['Admin', 'Auditor'].includes(employee.role)
+  const canManageUsers = employee.role === 'Admin'
+  const viewLabel = view === 'audit'
+    ? 'Audit log'
+    : view === 'history'
+      ? 'Historical applications'
+      : view === 'users'
+        ? 'Employee access'
+        : navItems.find((item) => item.id === view)?.label ?? 'Overview'
+  const visibleNavItems = navItems.filter((item) =>
+    item.id === 'overview'
+      ? ['Admin', 'Loan Officer', 'Underwriter'].includes(employee.role)
+      : item.id === 'applications' || item.id === 'workflow'
+        ? canAccessLoans
+        : canAccessFraud,
+  )
+
+  const openLoan = async (id: string) => {
+    if (!canAccessLoans) {
+      notify('Your role does not have access to application details.')
+      return
+    }
+    try {
+      await recordApplicationAccess(id)
+      setSelectedLoanId(id)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unable to open this application.'
+      setWorkflowError(message)
+      notify(message)
+    }
+  }
+
   return (
     <div className="app-shell">
       <aside className={`sidebar ${mobileNavOpen ? 'sidebar-open' : ''}`}>
@@ -495,11 +608,10 @@ function App() {
         </div>
 
         <nav className="primary-nav" aria-label="Main navigation">
-          {(['WORKSPACE', 'REVIEW & FOLLOW-UP'] as const).map(
-            (group) => (
+          {(['WORKSPACE', 'REVIEW & FOLLOW-UP'] as const).map((group) => (
               <div className="nav-group" key={group}>
                 <p className="nav-group-label">{group}</p>
-                {navItems
+                {visibleNavItems
                   .filter((item) => item.group === group)
                   .map((item) => {
                     const Icon =
@@ -522,9 +634,27 @@ function App() {
                         <span>{item.label}</span>
                       </button>
                     )
-                  })}
+                  })                  }
               </div>
-            ),
+          ))}
+          {canAccessAudit && (
+            <div className="nav-group">
+              <p className="nav-group-label">RECORDS</p>
+              <button className={`nav-item ${view === 'audit' ? 'nav-item-active' : ''}`} onClick={() => navigate('audit')}>
+                  <ShieldCheck size={17} strokeWidth={1.8} /><span>Audit log</span>
+              </button>
+              <button className={`nav-item ${view === 'history' ? 'nav-item-active' : ''}`} onClick={() => navigate('history')}>
+                  <FileText size={17} strokeWidth={1.8} /><span>Historical applications</span>
+              </button>
+            </div>
+          )}
+          {canManageUsers && (
+            <div className="nav-group">
+              <p className="nav-group-label">ADMINISTRATION</p>
+              <button className={`nav-item ${view === 'users' ? 'nav-item-active' : ''}`} onClick={() => navigate('users')}>
+                  <Users size={17} strokeWidth={1.8} /><span>Employee access</span>
+              </button>
+            </div>
           )}
         </nav>
 
@@ -534,12 +664,12 @@ function App() {
             <span>CHALLENGE SIMULATION</span>
           </div>
           <div className="profile-switch">
-            <div className="avatar avatar-navy">AR</div>
+            <div className="avatar avatar-navy">{employee.name.split(/\s+/).slice(0, 2).map((part) => part[0] ?? '').join('').toUpperCase()}</div>
             <div className="profile-copy">
-              <strong>Alex Rivera</strong>
-              <span>Lending operations</span>
+              <strong>{employee.name}</strong>
+              <span>{employee.role}</span>
             </div>
-            <MoreHorizontal size={18} className="muted-icon" />
+            <button className="icon-button" aria-label="Sign out" title="Sign out" onClick={onLogout}><LogOut size={16} /></button>
           </div>
         </div>
       </aside>
@@ -556,10 +686,10 @@ function App() {
           <div className="breadcrumb">
             <span>Commercial lending</span>
             <ChevronRight size={14} />
-            <strong>{navItems.find((item) => item.id === view)?.label}</strong>
+            <strong>{viewLabel}</strong>
           </div>
           <div className="topbar-actions">
-            <div className="sim-clock">
+            {employee.role === 'Admin' && <div className="sim-clock">
               <span className={`clock-live-dot ${workflow ? '' : 'clock-offline'}`} />
               <span>Demo time</span>
               <strong>{simulationDate}</strong>
@@ -574,8 +704,8 @@ function App() {
               >
                 Next hour
               </button>
-            </div>
-            <button
+            </div>}
+            {canAccessLoans && <button
               className="icon-button notification-button"
               aria-label="Notifications"
               onClick={() => navigate('workflow')}
@@ -584,8 +714,8 @@ function App() {
               {(workflow?.alerts.some((alert) => !alert.acknowledged) ?? false) && (
                 <span className="notification-dot" />
               )}
-            </button>
-            <div className="topbar-avatar">AR</div>
+            </button>}
+            <div className="topbar-avatar">{employee.name.split(/\s+/).slice(0, 2).map((part) => part[0] ?? '').join('').toUpperCase()}</div>
           </div>
         </header>
 
@@ -596,11 +726,11 @@ function App() {
               <span>Live workflow unavailable. This view may contain demonstration data. {workflowError}</span>
             </div>
           )}
-          {view === 'overview' && (
+          {view === 'overview' && canAccessLoans && (
             <Dashboard
               loans={loans}
               workflow={workflow}
-              onOpenLoan={(id) => setSelectedLoanId(id)}
+              onOpenLoan={(id) => void openLoan(id)}
               onNavigate={navigate}
             />
           )}
@@ -614,10 +744,10 @@ function App() {
               setStageFilter={setStageFilter}
               riskFilter={riskFilter}
               setRiskFilter={setRiskFilter}
-              onOpenLoan={(id) => setSelectedLoanId(id)}
+              onOpenLoan={(id) => void openLoan(id)}
             />
           )}
-          {view === 'fraud' && (
+          {view === 'fraud' && canAccessFraud && (
             <FraudCenter
               signals={signals}
               selectedSignal={selectedSignal}
@@ -628,7 +758,7 @@ function App() {
               analysisLoading={analysisLoading}
               analysisRefreshing={analysisRefreshing}
               onRefresh={() => void refreshFraudAnalysis()}
-              onOpenLoan={(id) => setSelectedLoanId(id)}
+              onOpenLoan={(id) => void openLoan(id)}
               onOpenNetwork={(id) => {
                 setNetworkFocusId(id)
                 navigate('network')
@@ -636,23 +766,26 @@ function App() {
               onAction={handleAction}
             />
           )}
-          {view === 'network' && (
+          {view === 'network' && canAccessFraud && (
             <NetworkExplorer
               loans={loans}
               initialSelection={networkFocusId}
               analysis={fraudAnalysis}
-              onOpenLoan={(id) => setSelectedLoanId(id)}
+              onOpenLoan={(id) => void openLoan(id)}
             />
           )}
-          {view === 'workflow' && (
+          {view === 'workflow' && canAccessLoans && (
             <WorkflowMonitor
               loans={loans}
               workflow={workflow}
-              onOpenLoan={(id) => setSelectedLoanId(id)}
+              onOpenLoan={(id) => void openLoan(id)}
               onNavigate={navigate}
               onAction={(loan, action) => void handleAction(loan, action)}
             />
           )}
+          {view === 'audit' && canAccessAudit && <AuditLog />}
+          {view === 'history' && canAccessAudit && <HistoricalRecords />}
+          {view === 'users' && canManageUsers && <UserManagement currentEmployee={employee} onLogout={onLogout} />}
         </div>
       </main>
 
@@ -661,6 +794,8 @@ function App() {
           loan={selectedLoan}
           onClose={() => setSelectedLoanId(null)}
           onAction={(action) => handleAction(selectedLoan, action)}
+          onDownload={(filename) => downloadApplicationDocument(selectedLoan.id, filename)}
+          canDownload={employee.role === 'Admin' || employee.role === 'Underwriter'}
         />
       )}
       {pendingAction && (
@@ -2066,10 +2201,14 @@ function LoanDrawer({
   loan,
   onClose,
   onAction,
+  onDownload,
+  canDownload,
 }: {
   loan: Loan
   onClose: () => void
   onAction: (action: string) => void
+  onDownload: (filename: string) => void
+  canDownload: boolean
 }) {
   const [tab, setTab] = useState<DetailTab>('Overview')
   const isEquipment = loan.product.toLowerCase().includes('equipment')
@@ -2208,7 +2347,11 @@ function LoanDrawer({
                     {document.legible ? <FileCheck2 size={15} /> : <FileText size={15} />}
                   </div>
                   <span>{document.name}<small className="document-source">{document.path}</small></span>
-                  <small className={document.legible ? 'doc-status-good' : 'doc-status-warn'}>{document.legible ? 'Extracted' : 'Unreadable'}</small>
+                  {canDownload ? (
+                    <button className="icon-button" aria-label={`Download ${document.name}`} title="Download document" onClick={() => onDownload(document.name)}>
+                      <Download size={15} />
+                    </button>
+                  ) : <small className={document.legible ? 'doc-status-good' : 'doc-status-warn'}>{document.legible ? 'Extracted' : 'Unreadable'}</small>}
                 </div>
               ))}
             </div>

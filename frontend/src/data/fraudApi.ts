@@ -1,3 +1,5 @@
+import { authRequest, errorMessage } from './authApi'
+
 export type FraudEvidence = {
   text: string
   source: string
@@ -200,26 +202,21 @@ export type WorkflowSnapshot = {
 }
 
 async function responseError(response: Response, fallback: string): Promise<Error> {
-  const body = await response.json().catch(() => null) as {
-    error?: string
-    blockers?: string[]
-  } | null
-  const detail = body?.blockers?.length
-    ? `${body.error ?? fallback}: ${body.blockers.join('; ')}`
-    : body?.error ?? `${fallback} (${response.status}).`
-  return new Error(detail)
+  const message = await errorMessage(response, fallback)
+  const blockers = response.headers.get('X-Workflow-Blockers')?.split('|').filter(Boolean) ?? []
+  return new Error(blockers.length ? `${message}: ${blockers.join('; ')}` : message)
 }
 
 export async function fetchFraudAnalysis(refresh = false): Promise<FraudAnalysis> {
   const response = refresh
-    ? await fetch('/api/reload', { method: 'POST', cache: 'no-store' })
-    : await fetch('/api/analysis', { cache: 'no-store' })
+    ? await authRequest('/api/reload', { method: 'POST' })
+    : await authRequest('/api/analysis')
   if (!response.ok) throw await responseError(response, 'Analysis service returned an error')
   return response.json() as Promise<FraudAnalysis>
 }
 
 export async function fetchWorkflow(): Promise<WorkflowSnapshot> {
-  const response = await fetch('/api/workflow', { cache: 'no-store' })
+  const response = await authRequest('/api/workflow')
   if (!response.ok) throw await responseError(response, 'Workflow service returned an error')
   return response.json() as Promise<WorkflowSnapshot>
 }
@@ -228,23 +225,34 @@ export async function postWorkflowAction(
   dealId: string,
   payload: Record<string, string>,
 ): Promise<WorkflowSnapshot> {
-  const response = await fetch(`/api/workflow/${encodeURIComponent(dealId)}/actions`, {
+  const response = await authRequest(`/api/workflow/${encodeURIComponent(dealId)}/actions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
-    cache: 'no-store',
   })
   if (!response.ok) throw await responseError(response, 'Workflow action failed')
   return response.json() as Promise<WorkflowSnapshot>
 }
 
 export async function advanceWorkflowClock(by: string): Promise<WorkflowSnapshot> {
-  const response = await fetch('/api/workflow/advance-clock', {
+  const response = await authRequest('/api/workflow/advance-clock', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ by }),
-    cache: 'no-store',
   })
   if (!response.ok) throw await responseError(response, 'Simulation clock update failed')
   return response.json() as Promise<WorkflowSnapshot>
+}
+
+export async function recordApplicationAccess(dealId: string): Promise<void> {
+  const response = await authRequest(`/api/workflow/${encodeURIComponent(dealId)}`)
+  if (!response.ok) throw await responseError(response, 'Application access failed')
+}
+
+export function downloadApplicationDocument(dealId: string, filename: string): void {
+  const url = `/api/workflow/${encodeURIComponent(dealId)}/documents/${encodeURIComponent(filename)}`
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.rel = 'noreferrer'
+  anchor.click()
 }

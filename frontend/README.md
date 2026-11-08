@@ -4,12 +4,24 @@ An interactive React and TypeScript demo for the HackUTD 2026 commercial-lending
 
 ## Run locally
 
-Start the analysis API from the repository root:
+Start the FastAPI service from the repository root. On the first run, supply a
+bootstrap Admin email and a unique password of at least 12 characters:
 
-```powershell
+```bash
 python -m pip install -r backend/requirements.txt
+export DEALPILOT_BOOTSTRAP_ADMIN_EMAIL="admin@your-company.example"
+printf 'Enter a unique bootstrap password (12+ characters): '
+IFS= read -r -s DEALPILOT_BOOTSTRAP_ADMIN_PASSWORD
+printf '\n'
+export DEALPILOT_BOOTSTRAP_ADMIN_PASSWORD
 python backend/server.py
 ```
+
+The bootstrap variables are only required until the first employee account is
+created. Accounts, hashed passwords, sessions, and audit events are stored in
+`backend/auth.sqlite3`; the database file is restricted to the current
+user. Do not use real borrower data or deploy this local demo without a
+production identity provider, HTTPS, and a security review.
 
 In a second terminal, start the frontend:
 
@@ -23,12 +35,31 @@ Use `npm run build` to type-check and create a production build, and `npm run li
 The Vite development server proxies `/api` requests to the Python service on port `8765`.
 The analysis service re-reads source records when files change; the **Recalculate** action forces a refresh.
 
-Run backend tests from the repository root in PowerShell:
+Run backend tests from the repository root:
 
-```powershell
-$env:PYTHONPATH = "backend"
-python -m unittest discover -s backend/tests
+```bash
+PYTHONPATH=backend python -m unittest discover -s backend/tests
 ```
+
+## Employee roles and audit
+
+- **Admin:** all workspace features, employee management, and audit records.
+- **Loan Officer:** overview, applications, and loan progress; no fraud graph access.
+- **Underwriter:** applications, loan progress, and protected document downloads.
+- **Fraud Investigator:** fraud analysis and connections, with workflow data redacted
+  to omit application financial fields and document contents.
+- **Auditor:** read-only historical applications and audit log; direct identifiers are omitted from historical results.
+
+The API enforces these permissions independently of the frontend. Admins create employees, assign roles, reset passwords, and disable accounts in
+**Employee access**. Passwords are salted and
+PBKDF2-hashed, sessions use an HttpOnly SameSite cookie and expire after eight
+hours, and repeated failed sign-ins are throttled. Sign-ins, rejected logins,
+portfolio, application, and historical-record access, document downloads, workflow actions, employee
+administration, and denied access attempts are recorded in the audit log.
+Workflow employee IDs must match the assigned workflow identity for actions
+which already require a specific assigned reviewer. The current demo has no
+supplier-payment editing feature, so it cannot produce supplier-payment change
+events.
 
 ## Demo behavior
 
@@ -37,7 +68,7 @@ python -m unittest discover -s backend/tests
 - Fraud signals, evidence references, scores, and network relationships come from the Python analysis service.
 - The review-priority index is an uncalibrated evidence-family coverage measure, not a probability or confirmed fraud finding.
 - Workflow actions and the simulation clock are persisted locally in SQLite and the challenge simulation state file. No external messages are sent.
-- Reviewer IDs are demo metadata, not authenticated identities. Do not use this service for real lending decisions.
+- Workflow employee IDs are linked to authenticated local accounts and are still demo metadata, not bank identities. Do not use this service for real lending decisions.
 - Known-rule checks are first-pass document heuristics. A human rationale is required to resolve an alerted or unevaluable check; this records review, not proof that a document is valid or fraud-free.
 - PDF text extraction depends on machine-readable text and the supplied layouts. Unreadable scans and unsupported layouts can leave fields or checks unevaluable.
 
@@ -47,7 +78,7 @@ The local API scans the shared-folder application PDFs on workflow requests, ext
 
 The workflow follows Intake → Credit → Committee → Product → Committed → Closed. Stage advancement is blocked by required documents, unresolved known-rule checks, missing product/vendor verification, commitment documentation, or closing controls. Human approvals are recorded with an actor ID and rationale where required. The simulation clock creates durable SLA alerts at 100%, 150%, and 200% of the applicable stage SLA, routed to the configured owner/escalation contact.
 
-Actions, alerts, and review history are local demo state. Role checks enforce the challenge's routing rules but are not authentication or authorization for a deployed bank system. Uploads are not accepted through an API endpoint; placing a new supported PDF in a shared-folder deal directory causes the next workflow scan to recalculate extracted data and checklist status.
+Actions, alerts, and review history are local demo state. FastAPI authentication and role checks protect the demo, but this is not a production banking identity or authorization system. Uploads are not accepted through an API endpoint; placing a new supported PDF in a shared-folder deal directory causes the next workflow scan to recalculate extracted data and checklist status.
 
 ## Cross-deal patterns
 

@@ -7,11 +7,22 @@ fraud analysis and workflow services are in [`backend`](./backend).
 
 ## Run locally
 
-```powershell
+The first backend start requires a one-time bootstrap Admin email and password.
+Choose a unique password of at least 12 characters; credentials are read from
+environment variables and are not stored in the repository.
+
+```bash
 python -m pip install -r backend/requirements.txt
+export DEALPILOT_BOOTSTRAP_ADMIN_EMAIL="admin@your-company.example"
+printf 'Enter a unique bootstrap password (12+ characters): '
+IFS= read -r -s DEALPILOT_BOOTSTRAP_ADMIN_PASSWORD
+printf '\n'
+export DEALPILOT_BOOTSTRAP_ADMIN_PASSWORD
 python backend/server.py
 ```
 
-In a second terminal, run `cd frontend; npm install; npm run dev`. The frontend proxies
-analysis and workflow requests to the service on `127.0.0.1:8765`. See
+On later starts, the employee account remains in the local auth database and the
+bootstrap variables are only needed if no employee has been created yet. In a
+second terminal, run `cd frontend && npm install && npm run dev`. The frontend proxies
+API requests to the service on `127.0.0.1:8765`. See
 [`frontend/README.md`](./frontend/README.md) for validation commands and limitations.

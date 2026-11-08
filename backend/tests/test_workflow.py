@@ -159,6 +159,78 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(updated["status"], "awaiting_information")
         self.assertEqual(updated["history"][0]["event_type"], "information_requested")
 
+    def test_admin_can_perform_workflow_actions_without_stage_assignment(self) -> None:
+        first = self.store.snapshot()["loans"][0]
+        admin_id = "tanmay.patankar.12"
+        self.assertNotEqual(first["owner"], admin_id)
+        self.assertFalse(first["blockers"])
+
+        self.store.act(
+            first["id"],
+            {
+                "action": "request_info",
+                "actor": admin_id,
+                "note": "Please provide the missing item.",
+            },
+            is_admin=True,
+        )
+        self.store.act(
+            first["id"],
+            {
+                "action": "request_hold",
+                "actor": admin_id,
+                "note": "Review the supporting evidence.",
+            },
+            is_admin=True,
+        )
+        self.store.act(
+            first["id"],
+            {
+                "action": "place_hold",
+                "actor": admin_id,
+                "note": "Admin review requires a temporary hold.",
+            },
+            is_admin=True,
+        )
+        released = self.store.act(
+            first["id"],
+            {
+                "action": "release_hold",
+                "actor": admin_id,
+                "note": "The review is complete.",
+            },
+            is_admin=True,
+        )
+        updated = next(item for item in released["loans"] if item["id"] == first["id"])
+        self.assertEqual(updated["fraudHold"], "none")
+        self.assertEqual(updated["fraudReview"], "cleared")
+        advanced = self.store.act(
+            first["id"],
+            {"action": "advance", "actor": admin_id},
+            is_admin=True,
+        )
+        advanced_loan = next(item for item in advanced["loans"] if item["id"] == first["id"])
+        self.assertNotEqual(advanced_loan["stage"], first["stage"])
+
+    def test_admin_can_make_human_gate_decisions_without_stage_assignment(self) -> None:
+        first = self.store.snapshot()["loans"][0]
+        with self.store._connection() as connection:
+            connection.execute(
+                "UPDATE workflow_deals SET stage='Committee' WHERE id=?",
+                (first["id"],),
+            )
+        result = self.store.act(
+            first["id"],
+            {
+                "action": "decline",
+                "actor": "tanmay.patankar.12",
+                "note": "The application does not meet committee criteria.",
+            },
+            is_admin=True,
+        )
+        updated = next(item for item in result["loans"] if item["id"] == first["id"])
+        self.assertEqual(updated["status"], "declined")
+
     def test_human_hold_lifecycle_requires_review_and_rationale(self) -> None:
         first = self.store.snapshot()["loans"][0]
         with self.assertRaises(WorkflowError):

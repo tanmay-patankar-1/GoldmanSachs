@@ -472,10 +472,50 @@ function DealPilotApp({
   }
 
   const handleAction = async (loan: Loan, actionLabel: string, form?: ActionForm) => {
-    const item = loan.workflow
+    let actionLoan = loan
+    let item = actionLoan.workflow
     if (!item) {
-      notify('Connect to the workflow service before recording a decision.')
-      return
+      try {
+        const snapshot = await fetchWorkflow()
+        setWorkflow(snapshot)
+        const borrowerNames = [loan.name, loan.legalName]
+          .map(normalizeBorrowerName)
+          .filter(Boolean)
+        const workflowNames = snapshot.loans.map((workflowLoan) => ({
+          workflowLoan,
+          names: [
+            workflowLoan.borrower,
+            workflowLoan.folder,
+            workflowLoan.application.legalName?.value ?? '',
+          ]
+            .map(normalizeBorrowerName)
+            .filter(Boolean)
+        }))
+        item = snapshot.loans.find((workflowLoan) => workflowLoan.id === loan.id)
+          ?? workflowNames.find(({ names }) =>
+            names.some((workflowName) => borrowerNames.includes(workflowName)),
+          )?.workflowLoan
+        if (!item) {
+          const possibleMatches = workflowNames.filter(({ names }) =>
+            names.some((workflowName) =>
+            borrowerNames.some((borrowerName) =>
+              workflowName === borrowerName
+              || workflowName.includes(borrowerName)
+              || borrowerName.includes(workflowName),
+            ),
+            ),
+          )
+          if (possibleMatches.length === 1) item = possibleMatches[0].workflowLoan
+        }
+        if (!item) throw new Error('This application is not available in the live workflow.')
+        actionLoan = { ...loan, workflow: item }
+        setWorkflowError('')
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unable to load workflow data.'
+        setWorkflowError(message)
+        notify(message)
+        return
+      }
     }
     let action = ({
       Approve: 'approve',
@@ -507,7 +547,7 @@ function DealPilotApp({
     let pricing = form?.pricing ?? ''
     if (['approve', 'decline', 'request_info', 'request_hold', 'escalate', 'place_hold', 'release_hold', 'clear_fraud', 'verify_vendor', 'verify_disbursement', 'resolve_check', 'release_funds'].includes(action)) {
       if (!form) {
-        setPendingAction({ loan, actionLabel, action })
+        setPendingAction({ loan: actionLoan, actionLabel, action })
         return
       }
       note = note.trim()
@@ -517,7 +557,7 @@ function DealPilotApp({
       }
     } else if (action === 'configure_product') {
       if (!form) {
-        setPendingAction({ loan, actionLabel, action })
+        setPendingAction({ loan: actionLoan, actionLabel, action })
         return
       }
       product = product.trim()
@@ -536,7 +576,7 @@ function DealPilotApp({
       if (checkCode) payload.checkCode = checkCode
       setWorkflow(await postWorkflowAction(item.id, payload))
       setWorkflowError('')
-      notify(`${actionLabel} recorded for ${loan.name}.`)
+      notify(`${actionLabel} recorded for ${actionLoan.name}.`)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Workflow action failed.'
       setWorkflowError(message)

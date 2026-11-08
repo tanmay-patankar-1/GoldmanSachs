@@ -922,7 +922,13 @@ class WorkflowStore:
         self._record(connection, deal["id"], "stage_advanced", f"Moved from {deal['stage']} to {next_stage}.", actor)
         return next_stage
 
-    def act(self, deal_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def act(
+        self,
+        deal_id: str,
+        payload: dict[str, Any],
+        *,
+        is_admin: bool = False,
+    ) -> dict[str, Any]:
         action = str(payload.get("action", ""))
         note = str(payload.get("note", "")).strip()
         actor = str(payload.get("actor", "")).strip()
@@ -946,11 +952,11 @@ class WorkflowStore:
                 gate = self.rules["stages"].get(deal["stage"], {}).get("human_gate")
                 if gate:
                     raise WorkflowError(f"{deal['stage']} requires an authorized human decision before it can advance.")
-                if actor != owner:
+                if actor != owner and not is_admin:
                     raise WorkflowError(f"Only the assigned stage owner ({self.people.get(owner, {}).get('name', owner)}) can advance this stage.")
                 self._advance_stage(connection, deal, packet, actor)
             elif action == "request_info":
-                if actor != owner:
+                if actor != owner and not is_admin:
                     raise WorkflowError(f"Only the assigned stage owner ({self.people.get(owner, {}).get('name', owner)}) can request information.")
                 if not note:
                     raise WorkflowError("Specify the information needed from the borrower.")
@@ -960,7 +966,7 @@ class WorkflowStore:
                 gate = self.rules["stages"].get(deal["stage"], {}).get("human_gate")
                 if not gate:
                     raise WorkflowError(f"{deal['stage']} has no approval gate.")
-                if actor != owner:
+                if actor != owner and not is_admin:
                     raise WorkflowError(f"This decision must be recorded by {self.people.get(owner, {}).get('name', owner)}.")
                 if action == "decline":
                     if not note:
@@ -973,14 +979,14 @@ class WorkflowStore:
                     self._record(connection, deal_id, "approved", note, actor)
                     self._advance_stage(connection, deal, packet, actor)
             elif action == "request_hold":
-                if actor != owner and actor not in fraud_ops:
+                if actor != owner and actor not in fraud_ops and not is_admin:
                     raise WorkflowError("Only the assigned stage owner or Fraud Operations can request a hold.")
                 if not note:
                     raise WorkflowError("Supporting evidence and rationale are required to request a fraud hold.")
                 connection.execute("UPDATE workflow_deals SET fraud_hold='requested', status='hold_requested', updated_at=? WHERE id=?", (_format_time(self.now()), deal_id))
                 self._record(connection, deal_id, "fraud_hold_requested", note, actor)
             elif action == "escalate":
-                if actor != owner:
+                if actor != owner and not is_admin:
                     raise WorkflowError("Only the assigned stage owner can escalate this application.")
                 if not note:
                     raise WorkflowError("A reason is required to escalate this application.")
@@ -989,11 +995,11 @@ class WorkflowStore:
                 connection.execute("UPDATE workflow_deals SET status='escalated', updated_at=? WHERE id=?", (_format_time(self.now()), deal_id))
                 self._record(connection, deal_id, "escalated", f"Escalated to {target}: {note}", actor)
             elif action == "mark_reviewed":
-                if actor != owner and actor not in fraud_ops:
+                if actor != owner and actor not in fraud_ops and not is_admin:
                     raise WorkflowError("Only the assigned stage owner or Fraud Operations can record a review.")
                 self._record(connection, deal_id, "review_recorded", note or "Review acknowledged; no fraud finding recorded.", actor)
             elif action == "resolve_check":
-                if deal["stage"] != "Credit" or actor != owner:
+                if deal["stage"] != "Credit" or (actor != owner and not is_admin):
                     raise WorkflowError("Only the assigned credit officer can resolve a known-rule check at the Credit stage.")
                 code = str(payload.get("checkCode", "")).strip()
                 check = next((item for item in packet["checks"] if item["code"] == code), None)
@@ -1015,7 +1021,7 @@ class WorkflowStore:
                 )
                 self._record(connection, deal_id, "known_check_reviewed", f"{code}: {note}", actor)
             elif action in {"place_hold", "release_hold", "clear_fraud"}:
-                if actor not in fraud_ops:
+                if actor not in fraud_ops and not is_admin:
                     raise WorkflowError("Only Fraud Operations can place, release, or clear a fraud hold.")
                 if action == "place_hold":
                     if deal["fraud_hold"] != "requested":
@@ -1039,28 +1045,28 @@ class WorkflowStore:
                     connection.execute("UPDATE workflow_deals SET fraud_hold='none', fraud_review='cleared', status='in_progress', updated_at=? WHERE id=?", (_format_time(self.now()), deal_id))
                     self._record(connection, deal_id, "fraud_review_cleared", note, actor)
             elif action == "configure_product":
-                if deal["stage"] != "Product" or actor != owner:
+                if deal["stage"] != "Product" or (actor != owner and not is_admin):
                     raise WorkflowError("Only the assigned Product owner can configure product terms at the Product stage.")
                 if not payload.get("product") or not payload.get("pricing"):
                     raise WorkflowError("Product and pricing terms are required.")
                 connection.execute("UPDATE workflow_deals SET product_configured=1, updated_at=? WHERE id=?", (_format_time(self.now()), deal_id))
                 self._record(connection, deal_id, "product_configured", f"{payload['product']} · {payload['pricing']}", actor)
             elif action == "verify_vendor":
-                if deal["stage"] != "Product" or actor != owner:
+                if deal["stage"] != "Product" or (actor != owner and not is_admin):
                     raise WorkflowError("Only the assigned Product owner can verify the vendor.")
                 if not note:
                     raise WorkflowError("Record how the vendor and remittance account were independently verified.")
                 connection.execute("UPDATE workflow_deals SET vendor_verified=1, updated_at=? WHERE id=?", (_format_time(self.now()), deal_id))
                 self._record(connection, deal_id, "vendor_verified", note, actor)
             elif action == "verify_disbursement":
-                if deal["stage"] != "Closed" or actor != owner:
+                if deal["stage"] != "Closed" or (actor != owner and not is_admin):
                     raise WorkflowError("Only the assigned Closing officer can verify the disbursement account.")
                 if not note:
                     raise WorkflowError("Record how the disbursement account was verified.")
                 connection.execute("UPDATE workflow_deals SET disbursement_verified=1, updated_at=? WHERE id=?", (_format_time(self.now()), deal_id))
                 self._record(connection, deal_id, "disbursement_verified", note, actor)
             elif action == "release_funds":
-                if deal["stage"] != "Closed" or actor != owner:
+                if deal["stage"] != "Closed" or (actor != owner and not is_admin):
                     raise WorkflowError("Only the assigned Closing & Funding Officer can release funds.")
                 if not note:
                     raise WorkflowError("A funding-release rationale is required.")
@@ -1084,7 +1090,7 @@ class WorkflowStore:
                     ),
                     "",
                 )
-                if actor not in {alert_owner, owner, *fraud_ops}:
+                if actor not in {alert_owner, owner, *fraud_ops} and not is_admin:
                     raise WorkflowError("Only the alert recipient, stage owner, or Fraud Operations can acknowledge this alert.")
                 connection.execute("UPDATE workflow_alerts SET acknowledged=1 WHERE id=? AND deal_id=?", (alert_id, deal_id))
                 self._record(connection, deal_id, "alert_acknowledged", note or "SLA alert acknowledged.", actor)

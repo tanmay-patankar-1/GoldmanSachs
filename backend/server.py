@@ -445,7 +445,11 @@ def workflow_action(
     trusted_payload = dict(payload)
     trusted_payload["actor"] = employee["employeeId"]
     try:
-        result = _workflow_store.act(unquote(deal_id), trusted_payload)
+        result = _workflow_store.act(
+            unquote(deal_id),
+            trusted_payload,
+            is_admin=employee["role"] == "Admin",
+        )
         _auth_store.record(
             employee, "workflow_action", f"application:{deal_id}", action, _ip(request)
         )

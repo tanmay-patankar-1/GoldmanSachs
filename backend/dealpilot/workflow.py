@@ -13,7 +13,7 @@ from typing import Any, Generator
 
 from pypdf import PdfReader
 
-from dealpilot.engine import _relative_source, normalize_supplier
+from dealpilot.engine import Page, _packet_name, _relative_source, normalize_supplier
 
 
 CENTRAL = timezone(timedelta(hours=-6))
@@ -179,6 +179,38 @@ def _load_documents(folder: Path, root: Path) -> tuple[list[dict[str, Any]], lis
                     })
         except Exception as exc:
             raise RuntimeError(f"Unable to read application document {path}: {exc}") from exc
+    for path in sorted(folder.rglob("*.csv")):
+        try:
+            with path.open(encoding="utf-8-sig", newline="") as stream:
+                reader = csv.reader(stream)
+                header = next(
+                    (
+                        row for row in reader
+                        if (
+                            {"details", "amount"} <= {field.strip().casefold() for field in row}
+                            and bool(
+                                {"posted date", "date", "transaction date"}
+                                & {field.strip().casefold() for field in row}
+                            )
+                        )
+                    ),
+                    None,
+                )
+                if header is None:
+                    continue
+                legible = any(
+                    any(value.strip() for value in row)
+                    for row in reader
+                )
+                documents.append({
+                    "name": path.name,
+                    "category": "bank_statement",
+                    "path": _relative_source(path, root),
+                    "pages": 1,
+                    "legible": legible,
+                })
+        except (OSError, UnicodeDecodeError, csv.Error) as exc:
+            raise RuntimeError(f"Unable to read transaction export {path}: {exc}") from exc
     return documents, pages
 
 
@@ -222,6 +254,23 @@ def _required_documents(
                 continue
             if start.day == 1 and (end + timedelta(days=1)).day == 1:
                 statement_months.add(end.strftime("%Y-%m"))
+    month_names = {
+        month.casefold(): index
+        for index, month in enumerate(
+            ("January", "February", "March", "April", "May", "June", "July",
+             "August", "September", "October", "November", "December"),
+            start=1,
+        )
+    }
+    for document in documents:
+        match = re.search(
+            r"(?:^|[^A-Za-z])(January|February|March|April|May|June|July|August|September|October|November|December)"
+            r"[_-](20\d{2})\b",
+            document["name"],
+            re.I,
+        )
+        if match and document["legible"]:
+            statement_months.add(f"{match.group(2)}-{month_names[match.group(1).casefold()]:02d}")
     expected_statement_months: set[str] = set()
     month_cursor = clock_now.date().replace(day=1)
     for _ in range(6):
@@ -322,10 +371,16 @@ def _known_fraud_checks(
         if monthly_deposits else None
     )
     revenue_flagged = bool(revenue and annualized and revenue > annualized * 1.5)
+    revenue_ratio = revenue / annualized if revenue is not None and annualized else None
     checks.append({
         "code": "REV_INFLATION",
         "status": "flagged" if revenue_flagged else "clear" if revenue is not None and annualized else "not_evaluable",
-        "evidence": f"Stated revenue ${revenue:,.0f}; annualized statement deposits ${annualized:,.0f}." if revenue is not None and annualized else "Need numeric stated revenue and at least one extractable statement-deposit total.",
+        "evidence": (
+            f"Stated revenue ${revenue:,.0f}; annualized statement deposits "
+            f"${annualized:,.0f}; ratio {revenue_ratio:.2f}x against the 1.50x threshold."
+            if revenue is not None and annualized and revenue_ratio is not None else
+            "Need numeric stated revenue and at least one extractable statement-deposit total."
+        ),
     })
     statement_pages = [(path, number, text) for path, number, text in pages if _document_category(path, text) == "bank_statement"]
     tamper_evidence: list[str] = []
@@ -339,14 +394,30 @@ def _known_fraud_checks(
         withdrawals = money_after(r"Total withdrawals\s*&\s*debits")
         closing = money_after("Closing balance")
         period = re.search(r"Statement period\s*\n\s*(\d{4}-\d{2})", text, re.I)
-        if None not in (opening, deposits, withdrawals, closing) and period:
+        if (
+            opening is not None
+            and deposits is not None
+            and withdrawals is not None
+            and closing is not None
+            and period
+        ):
             statements.append((period.group(1), opening, deposits, withdrawals, closing, _relative_source(path, root, number)))
-            if abs(opening + deposits - withdrawals - closing) > 0.02:
-                tamper_evidence.append(f"{period.group(1)} summary arithmetic does not reconcile ({_relative_source(path, root, number)}).")
+            calculated_closing = opening + deposits - withdrawals
+            discrepancy = abs(calculated_closing - closing)
+            if discrepancy > 0.02:
+                tamper_evidence.append(
+                    f"{period.group(1)} reported closing balance ${closing:,.2f} differs "
+                    f"from the calculated ${calculated_closing:,.2f} by "
+                    f"${discrepancy:,.2f} ({_relative_source(path, root, number)})."
+                )
     statements.sort()
     for previous, current in zip(statements, statements[1:]):
         if abs(previous[4] - current[1]) > 0.02:
-            tamper_evidence.append(f"{current[0]} opening balance does not match the prior statement closing balance ({current[5]}).")
+            tamper_evidence.append(
+                f"{current[0]} opening balance ${current[1]:,.2f} does not match "
+                f"the prior reported closing balance ${previous[4]:,.2f} "
+                f"({current[5]})."
+            )
     checks.append({
         "code": "STMT_TAMPER",
         "status": "flagged" if tamper_evidence else "clear" if statements else "not_evaluable",
@@ -468,7 +539,10 @@ class WorkflowStore:
             if not pages:
                 continue
             app = _extract_application(pages)
-            borrower = app.get("legalName", {}).get("value") or folder.name
+            borrower = app.get("legalName", {}).get("value") or _packet_name(
+                folder.name,
+                [Page(path, number, text) for path, number, text in pages],
+            )
             rows.append({
                 "id": "wf-" + re.sub(r"[^a-z0-9]+", "-", folder.name.casefold()).strip("-"),
                 "folder": folder.name,

@@ -65,8 +65,24 @@ class WorkflowTests(unittest.TestCase):
 
     def test_snapshot_extracts_packets_and_required_evidence(self) -> None:
         snapshot = self.store.snapshot()
-        self.assertGreater(len(snapshot["loans"]), 0)
+        self.assertEqual(len(snapshot["loans"]), 13)
         self.assertEqual(snapshot["historicalSla"]["events"], 1288)
+        expected_checks = {
+            "STMT_TAMPER",
+            "REV_INFLATION",
+            "ID_MISMATCH",
+            "DUP_EIN",
+            "SHELL_ADDRESS",
+        }
+        self.assertTrue(all(
+            {check["code"] for check in loan["checks"]} == expected_checks
+            for loan in snapshot["loans"]
+        ))
+        lone_star = next(
+            item for item in snapshot["loans"]
+            if item["folder"] == "LSFD_docs"
+        )
+        self.assertEqual(lone_star["borrower"], "Lone Star Family Dental PLLC")
         first = snapshot["loans"][0]
         self.assertTrue(first["application"])
         self.assertTrue(first["requiredDocuments"])
@@ -75,6 +91,31 @@ class WorkflowTests(unittest.TestCase):
             {"STMT_TAMPER", "REV_INFLATION", "ID_MISMATCH", "DUP_EIN", "SHELL_ADDRESS"},
         )
         self.assertTrue(first["ownerName"])
+        loopwise = next(
+            item for item in snapshot["loans"] if "Loopwise Labs" in item["borrower"]
+        )
+        statements = next(
+            item for item in loopwise["requiredDocuments"]
+            if item["key"] == "bank_statement"
+        )
+        self.assertEqual(statements["monthCount"], 5)
+        self.assertIn("5 of 6", statements["label"])
+        granite = next(
+            item for item in snapshot["loans"]
+            if "Granite Bay Building Supply" in item["borrower"]
+        )
+        granite_checks = {check["code"]: check for check in granite["checks"]}
+        self.assertEqual(granite_checks["STMT_TAMPER"]["status"], "flagged")
+        self.assertIn("$48,200.00", granite_checks["STMT_TAMPER"]["evidence"])
+        self.assertEqual(granite_checks["REV_INFLATION"]["status"], "flagged")
+        self.assertIn("3.06x", granite_checks["REV_INFLATION"]["evidence"])
+        self.assertEqual(
+            {
+                code for code, check in granite_checks.items()
+                if check["status"] == "flagged"
+            },
+            {"STMT_TAMPER", "REV_INFLATION"},
+        )
 
     def test_intake_blockers_do_not_require_credit_stage_documents(self) -> None:
         self.store.snapshot()

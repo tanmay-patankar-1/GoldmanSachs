@@ -17,10 +17,14 @@ export type HistoricalDealReference = {
 
 export type CrossDealSignal = {
   id: string
+  investigationId?: string
   family: string
   scoreFamily?: string
   title: string
-  classification: 'new_cross_deal_lead' | 'shared_relationship_observation'
+  classification:
+    | 'new_cross_deal_lead'
+    | 'shared_relationship_observation'
+    | 'document_review_issue'
   severity: 'High' | 'Elevated' | 'Moderate'
   description: string
   borrowers: string[]
@@ -28,6 +32,63 @@ export type CrossDealSignal = {
   evidence: FraudEvidence[]
   recommendedActions: string[]
   scoreContribution?: boolean
+  riskDimension?: 'investigation' | 'behavioral_anomaly'
+  behaviorSeverity?: 'Low' | 'Moderate' | 'High'
+  depositBehavior?: {
+    industryCode: string | null
+    industryPeerCount: number
+    comparisonDealCount: number
+    comparisonScope: 'industry' | 'all_industries'
+    dealLevelMean: number
+    historicalMedian: number
+    historical95thPercentile: number
+    observedPercentile: number
+    channelBreakdown: Record<string, number>
+    historicalChannelComparisonAvailable: boolean
+  }
+  mlAnomaly?: {
+    algorithm: string
+    percentile: number
+    isOutlier: boolean
+    thresholdPercentile: number
+  }
+  transactionSummary?: {
+    sharedReferenceCount: number
+    sharedReferences: string[]
+    sharedDestinations: string[]
+    matchedPostingDates: number
+  }
+}
+
+export type FraudInvestigation = {
+  id: string
+  title: string
+  severity: 'High' | 'Elevated' | 'Moderate'
+  borrowers: string[]
+  signalIds: string[]
+  patterns: string[]
+  priorityScore: number
+  scoreIsProbability: false
+  severityBasis?: string
+}
+
+export type FraudScoreEvidence = {
+  text: string
+  source: string
+  kind: string
+}
+
+export type FraudScoreContribution = {
+  family: string
+  label: string
+  points: number
+  urgency: 'Low' | 'Moderate' | 'Elevated' | 'High' | 'Urgent'
+  rationale: string
+  signals: Array<{
+    id: string
+    title: string
+    evidence: FraudScoreEvidence[]
+  }>
 }
 
 export type FraudGraphNode = {
@@ -54,6 +115,9 @@ export type FraudAnalysis = {
     historicalDeals: number
     currentPackets: number
     crossDealSignals: number
+    documentReviewFindings: number
+    mlAnomalyFindings: number
+    investigations: number
     linkedApplications: number
     graphNodes: number
     graphRelationships: number
@@ -82,13 +146,33 @@ export type FraudAnalysis = {
     }
   }
   scoreMethod: string
+  mlModel?: {
+    algorithm: string
+    trainingMode: string
+    trainingRows: number
+    excludedKnownRuleRows: number
+    scoredApplications: number
+    outlierApplications: number
+    thresholdPercentile: number
+    features: string[]
+    limitations: string
+  }
   scores: Array<{
     borrower: string
+    folder?: string
     score: number
     families: string[]
+    additionalFamilies?: string[]
+    scoreBreakdown?: FraudScoreContribution[]
     method: string
+    mlAnomaly?: {
+      percentile: number
+      isOutlier: boolean
+      thresholdPercentile: number
+    }
   }>
   signals: CrossDealSignal[]
+  investigations?: FraudInvestigation[]
   graph: {
     nodes: FraudGraphNode[]
     edges: FraudGraphEdge[]

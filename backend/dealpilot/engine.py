@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import csv
+import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from itertools import combinations
 from pathlib import Path
 from typing import Any
 
 from pypdf import PdfReader
+
+from dealpilot.ml_model import HistoricalAnomalyModel, train_historical_anomaly_model
 
 
 LEGAL_SUFFIXES = {
@@ -43,6 +46,18 @@ EXPENSE_METRICS = (
 AMOUNT_RE = re.compile(r"-?\$[\d,]+(?:\.\d{2})?")
 DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
 QUOTE_ID_RE = re.compile(r"\b([A-Z][A-Z0-9]{0,5})-?(\d{3,})\b")
+TRANSACTION_DATE_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$")
+TRANSACTION_AMOUNT_RE = re.compile(r"^-?\$?[\d,]+\.\d{2}$")
+TRANSACTION_REFERENCE_RE = re.compile(
+    r"\b((?:INV(?:OICE)?|REF(?:ERENCE)?|TRACE|CHK|CHECK)[#:\s-]*"
+    r"[A-Z0-9]+(?:-[A-Z0-9]+){1,4})\b",
+    re.I,
+)
+DESTINATION_ACCOUNT_RE = re.compile(
+    r"\b(?:TO|DEST(?:INATION)?(?:\s+ACCOUNT)?|ACCOUNT\s+ENDING)\s+"
+    r"(?:X{2,}|\*{2,})?(\d{4})\b",
+    re.I,
+)
 
 
 @dataclass
@@ -59,6 +74,7 @@ class Packet:
     pages: list[Page]
     source_name: str
     quotes: list[dict[str, Any]] = field(default_factory=list)
+    transactions: list[dict[str, Any]] = field(default_factory=list)
     financials: dict[str, float] = field(default_factory=dict)
     preparer: str | None = None
 
@@ -179,6 +195,135 @@ def _quote_records(pages: list[Page], root: Path) -> list[dict[str, Any]]:
     return quotes
 
 
+def _transaction_record(
+    date_value: str,
+    description: str,
+    amount: float,
+    source: str,
+) -> dict[str, Any]:
+    reference = TRANSACTION_REFERENCE_RE.search(description)
+    destination = DESTINATION_ACCOUNT_RE.search(description)
+    return {
+        "date": date_value,
+        "description": re.sub(r"\s+", " ", description).strip(),
+        "amount": abs(amount),
+        "direction": "credit" if re.search(r"\b(?:CREDIT|DEPOSIT|TRANSFER IN|WIRE IN)\b", description, re.I) else "debit",
+        "reference": reference.group(1).upper() if reference else None,
+        "destinationLast4": destination.group(1) if destination else None,
+        "wholeDollar": amount.is_integer(),
+        "source": source,
+    }
+
+
+def _statement_transactions(packet: Packet, root: Path) -> list[dict[str, Any]]:
+    transactions: list[dict[str, Any]] = []
+    for page in packet.pages:
+        if not re.search(r"\b(?:bank|checking|statement)\b", page.text, re.I):
+            continue
+        lines = [line.strip() for line in page.text.splitlines()]
+        for index, line in enumerate(lines):
+            if not TRANSACTION_DATE_RE.fullmatch(line):
+                continue
+            try:
+                date_value = datetime.strptime(line, "%m/%d/%Y").date().isoformat()
+            except ValueError:
+                continue
+            description_index = index + 1
+            while description_index < len(lines) and not lines[description_index]:
+                description_index += 1
+            if description_index >= len(lines):
+                continue
+            description = lines[description_index]
+            amount = None
+            for candidate in lines[description_index + 1 : description_index + 5]:
+                if TRANSACTION_DATE_RE.fullmatch(candidate):
+                    break
+                if TRANSACTION_AMOUNT_RE.fullmatch(candidate):
+                    amount = float(candidate.replace("$", "").replace(",", ""))
+                    break
+            if amount is None:
+                continue
+            transactions.append(
+                _transaction_record(
+                    date_value,
+                    description,
+                    amount,
+                    _relative_source(page.path, root, page.number),
+                )
+            )
+    return transactions
+
+
+def _csv_transactions(folder: Path, root: Path) -> list[dict[str, Any]]:
+    transactions: list[dict[str, Any]] = []
+    for path in sorted(folder.rglob("*.csv")):
+        try:
+            with path.open(encoding="utf-8-sig", newline="") as stream:
+                reader = csv.reader(stream)
+                header = next(
+                    (
+                        row for row in reader
+                        if (
+                            {"details", "amount"} <= {field.strip().casefold() for field in row}
+                            and bool(
+                                {"posted date", "date", "transaction date"}
+                                & {field.strip().casefold() for field in row}
+                            )
+                        )
+                    ),
+                    None,
+                )
+                if header is None:
+                    continue
+                fields = {
+                    field.strip().casefold(): index
+                    for index, field in enumerate(header)
+                }
+                date_field = next(
+                    (fields[key] for key in ("posted date", "date", "transaction date") if key in fields),
+                    None,
+                )
+                description_field = next(
+                    (fields[key] for key in ("details", "description", "transaction description") if key in fields),
+                    None,
+                )
+                amount_field = next(
+                    (fields[key] for key in ("amount", "transaction amount") if key in fields),
+                    None,
+                )
+                if date_field is None or description_field is None or amount_field is None:
+                    continue
+                for row in reader:
+                    if max(date_field, description_field, amount_field) >= len(row):
+                        continue
+                    raw_date = row[date_field].strip()
+                    parsed_date = None
+                    for fmt in ("%m/%d/%y", "%m/%d/%Y", "%Y-%m-%d"):
+                        try:
+                            parsed_date = datetime.strptime(raw_date, fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                    try:
+                        amount = float(row[amount_field].replace(",", "").replace("$", ""))
+                    except ValueError:
+                        continue
+                    description = row[description_field].strip()
+                    if not parsed_date or not description:
+                        continue
+                    transactions.append(
+                        _transaction_record(
+                            parsed_date.isoformat(),
+                            description,
+                            amount,
+                            _relative_source(path, root),
+                        )
+                    )
+        except (OSError, UnicodeDecodeError, csv.Error) as exc:
+            raise RuntimeError(f"Unable to read transaction CSV {path}: {exc}") from exc
+    return transactions
+
+
 def _preparer(pages: list[Page]) -> tuple[str | None, Page | None]:
     for page in pages:
         match = re.search(r"Prepared by:\s*([^\n]+)", page.text, re.I)
@@ -241,6 +386,8 @@ def _read_packets(shared_folder: Path, root: Path) -> list[Packet]:
         packet.quotes = _quote_records(pages, root)
         for quote in packet.quotes:
             quote["borrower"] = name
+        packet.transactions = _statement_transactions(packet, root)
+        packet.transactions.extend(_csv_transactions(folder, root))
         packet.financials = _financial_signature(pages)
         packet.preparer, _ = _preparer(pages)
         packets.append(packet)
@@ -319,6 +466,10 @@ def _historical_data(history_dir: Path, root: Path) -> tuple[list[dict[str, Any]
     with deals_path.open(encoding="utf-8-sig", newline="") as stream:
         deals = list(csv.DictReader(stream))
     line_by_deal = {row["deal_id"]: index + 2 for index, row in enumerate(deals)}
+    industry_by_deal = {
+        row.get("deal_id", ""): row.get("naics") or row.get("industry", "")
+        for row in deals
+    }
 
     deposit_path = history_dir / "monthly_deposits.csv"
     monthly: dict[str, list[float]] = defaultdict(list)
@@ -335,6 +486,7 @@ def _historical_data(history_dir: Path, root: Path) -> tuple[list[dict[str, Any]
         {
             "deal_id": deal_id,
             "meanRoundDepositPct": sum(values) / len(values),
+            "industry": industry_by_deal.get(deal_id, ""),
         }
         for deal_id, values in monthly.items()
         if values
@@ -385,6 +537,293 @@ def _historical_data(history_dir: Path, root: Path) -> tuple[list[dict[str, Any]
             }
         )
     return deals, baseline, records
+
+
+def _parse_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value.strip())
+    except ValueError:
+        for date_format in ("%m/%d/%Y", "%m/%d/%y"):
+            try:
+                return datetime.strptime(value.strip(), date_format).date()
+            except ValueError:
+                continue
+    return None
+
+
+def _float_value(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = float(value.replace(",", "").replace("$", "").strip())
+    except ValueError:
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _purpose_group(value: str) -> str:
+    text = value.casefold()
+    for group, terms in (
+        ("equipment", ("equipment", "vehicle", "trailer", "machinery")),
+        ("inventory", ("inventory", "stock")),
+        ("payroll", ("payroll", "wages")),
+        ("real_estate", ("real estate", "property", "building")),
+        ("refinance", ("refinance", "refinancing", "debt")),
+        ("expansion", ("expansion", "expand", "growth", "route")),
+    ):
+        if any(term in text for term in terms):
+            return group
+    return "other" if text else ""
+
+
+def _monthly_ml_features(
+    monthly_rows: list[dict[str, str]], revenue: float | None
+) -> dict[str, float]:
+    totals: list[float] = []
+    counts: list[float] = []
+    round_rates: list[float] = []
+    largest_deposits: list[float] = []
+    ending_balances: list[float] = []
+    for row in monthly_rows:
+        total = _float_value(row.get("total_deposits"))
+        count = _float_value(row.get("deposit_count"))
+        round_rate = _float_value(row.get("pct_deposits_multiple_of_100"))
+        largest = _float_value(row.get("largest_deposit"))
+        balance = _float_value(row.get("month_end_balance"))
+        if total is not None and total >= 0:
+            totals.append(total)
+        if count is not None and count >= 0:
+            counts.append(count)
+        if round_rate is not None and 0 <= round_rate <= 1:
+            round_rates.append(round_rate)
+        if largest is not None and largest >= 0:
+            largest_deposits.append(largest)
+        if balance is not None and balance >= 0:
+            ending_balances.append(balance)
+
+    mean_total = sum(totals) / len(totals) if totals else 0.0
+    total_cv = (
+        math.sqrt(sum((value - mean_total) ** 2 for value in totals) / len(totals))
+        / mean_total
+        if mean_total > 0 else 0.0
+    )
+    return {
+        "deposit_months": float(len(totals)),
+        "mean_deposit_count": sum(counts) / len(counts) if counts else 0.0,
+        "round_deposit_share": sum(round_rates) / len(round_rates) if round_rates else 0.0,
+        "deposit_volume_cv": total_cv,
+        "annualized_deposits_to_revenue": (
+            mean_total * 12 / revenue if revenue and revenue > 0 else 0.0
+        ),
+        "largest_deposit_to_monthly_deposits": (
+            sum(largest_deposits) / len(largest_deposits) / mean_total
+            if largest_deposits and mean_total > 0 else 0.0
+        ),
+        "ending_balance_to_revenue": (
+            sum(ending_balances) / len(ending_balances) / revenue
+            if ending_balances and revenue and revenue > 0 else 0.0
+        ),
+        "has_deposit_history": float(bool(totals)),
+    }
+
+
+def _ml_features(
+    *,
+    amount: float | None,
+    revenue: float | None,
+    term: float | None,
+    business_age: float | None,
+    industry: str,
+    product: str,
+    purpose: str,
+    bank: str,
+    monthly_rows: list[dict[str, str]],
+) -> dict[str, float | str]:
+    features: dict[str, float | str] = {
+        "industry": industry.strip().casefold(),
+        "product": product.strip().casefold(),
+        "purpose_group": _purpose_group(purpose),
+        "bank": bank.strip().casefold(),
+        "log_annual_revenue": math.log1p(revenue) if revenue is not None and revenue > 0 else 0.0,
+        "log_loan_amount": math.log1p(amount) if amount is not None and amount > 0 else 0.0,
+        "loan_to_revenue": amount / revenue if amount is not None and revenue and revenue > 0 else 0.0,
+        "term_months": term or 0.0,
+        "business_age_years": business_age or 0.0,
+        "has_annual_revenue": float(revenue is not None and revenue > 0),
+        "has_loan_amount": float(amount is not None and amount > 0),
+        "has_term": float(term is not None and term > 0),
+        "has_business_age": float(business_age is not None and business_age > 0),
+    }
+    features.update(_monthly_ml_features(monthly_rows, revenue))
+    return features
+
+
+def _historical_ml_features(
+    deals: list[dict[str, Any]],
+    monthly_rows: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    monthly_by_deal: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in monthly_rows:
+        monthly_by_deal[row.get("deal_id", "")].append(row)
+
+    results: list[dict[str, Any]] = []
+    for row in deals:
+        application_date = _parse_date(row.get("application_date", ""))
+        formation_date = _parse_date(row.get("formation_date", ""))
+        business_age = (
+            (application_date - formation_date).days / 365.25
+            if application_date and formation_date and application_date >= formation_date
+            else None
+        )
+        revenue = _float_value(row.get("annual_revenue_stated"))
+        features = _ml_features(
+            amount=_float_value(row.get("amount_requested")),
+            revenue=revenue,
+            term=_float_value(row.get("term_months")),
+            business_age=business_age,
+            industry=row.get("naics") or row.get("industry", ""),
+            product=row.get("product", ""),
+            purpose=row.get("purpose", ""),
+            bank=row.get("bank_name", ""),
+            monthly_rows=monthly_by_deal.get(row.get("deal_id", ""), []),
+        )
+        results.append({"fraud_label": row.get("fraud_label", "none"), "features": features})
+    return results
+
+
+def _current_ml_features(
+    packet: Packet, root: Path
+) -> tuple[dict[str, float | str], str]:
+    established = _application_field_value(packet, r"Date business established")
+    established_date = _parse_date(established)
+    business_age = (
+        (date.today() - established_date).days / 365.25
+        if established_date and established_date <= date.today()
+        else None
+    )
+    industry_text = _application_field_value(packet, r"Industry(?:\s*\(NAICS\))?")
+    naics = re.search(r"\b(\d{6})\b", industry_text)
+    bank_text = _application_field_value(packet, r"Primary bank(?:\s*/\s*account)?")
+    bank = re.sub(r"\s+(?:\.{2,}|…|\*{2,}|x{2,}).*$", "", bank_text, flags=re.I)
+
+    deposits_by_month: dict[str, list[float]] = defaultdict(list)
+    for transaction in packet.transactions:
+        if transaction.get("direction") != "credit":
+            continue
+        month = transaction["date"][:7]
+        deposits_by_month[month].append(float(transaction["amount"]))
+    monthly_rows = [
+        {
+            "total_deposits": str(sum(amounts)),
+            "deposit_count": str(len(amounts)),
+            "pct_deposits_multiple_of_100": str(
+                sum(abs(amount / 100 - round(amount / 100)) < 1e-9 for amount in amounts)
+                / len(amounts)
+            ),
+            "largest_deposit": str(max(amounts)),
+        }
+        for amounts in deposits_by_month.values()
+        if amounts
+    ]
+    revenue = _float_value(_application_field_value(packet, r"Annual revenue(?:\s*\([^)]*\))?"))
+    amount = _float_value(_application_field_value(packet, r"Amount requested"))
+    term_match = re.search(
+        r"(\d+(?:\.\d+)?)",
+        _application_field_value(packet, r"Requested term"),
+    )
+    term = float(term_match.group(1)) if term_match else None
+    features = _ml_features(
+        amount=amount,
+        revenue=revenue,
+        term=term,
+        business_age=business_age,
+        industry=naics.group(1) if naics else industry_text,
+        product=_application_field_value(packet, r"Product"),
+        purpose=_application_field_value(packet, r"Use of proceeds"),
+        bank=bank,
+        monthly_rows=monthly_rows,
+    )
+    source_page = next(
+        (page for page in packet.pages if "application" in page.path.name.casefold()),
+        packet.pages[0],
+    )
+    return features, _relative_source(source_page.path, root, source_page.number)
+
+
+def _application_field_value(packet: Packet, pattern: str) -> str:
+    for page in packet.pages:
+        lines = [line.strip() for line in page.text.splitlines()]
+        for index, line in enumerate(lines):
+            if re.fullmatch(pattern, line, re.I):
+                return next(
+                    (candidate for candidate in lines[index + 1:] if candidate),
+                    "",
+                )
+    return ""
+
+
+def _ml_anomaly_signals(
+    packets: list[Packet],
+    model: HistoricalAnomalyModel,
+    root: Path,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    feature_rows: list[dict[str, float | str]] = []
+    sources: list[str] = []
+    for packet in packets:
+        features, source = _current_ml_features(packet, root)
+        feature_rows.append(features)
+        sources.append(source)
+
+    results = model.score(feature_rows)
+    signals: list[dict[str, Any]] = []
+    by_borrower: dict[str, dict[str, Any]] = {}
+    for packet, source, result in zip(packets, sources, results):
+        anomaly = {
+            **result,
+            "algorithm": "Isolation Forest",
+        }
+        by_borrower[normalize_supplier(packet.name)] = anomaly
+        if not result["isOutlier"]:
+            continue
+        record = {
+            "borrower": packet.name,
+            "borrowerKey": normalize_supplier(packet.name),
+            "current": True,
+            "dealId": None,
+        }
+        signal = _make_signal(
+            f"ml-anomaly-{len(signals) + 1}",
+            "ml_anomaly",
+            "Historical-profile anomaly flagged by ML model",
+            "An unsupervised Isolation Forest found this application's combination of "
+            "loan, business, and deposit features unusual relative to historical deals. "
+            "This is a review lead, not evidence of fraud.",
+            "Moderate",
+            [record],
+            [
+                _evidence(
+                    f"Isolation Forest anomaly rank: {result['percentile']:.1f}th "
+                    f"percentile versus {model.training_rows} historical applications "
+                    "without existing bank-rule labels. This percentile is not a fraud probability.",
+                    source,
+                    "isolation_forest_anomaly_rank",
+                )
+            ],
+            [
+                "Review the application and source statements for the features that differ from historical patterns.",
+                "Verify any unusual figures with independent borrower and bank records.",
+            ],
+        )
+        signal["scoreContribution"] = False
+        signal["riskDimension"] = "behavioral_anomaly"
+        signal["behaviorSeverity"] = (
+            "High" if result["percentile"] >= 99.5 else "Moderate"
+        )
+        signal["mlAnomaly"] = anomaly
+        signals.append(signal)
+    return signals, by_borrower
 
 
 def _historical_preparers(
@@ -940,6 +1379,8 @@ def _financial_structure_signals(
         )
         signal["entityKey"] = ",".join(sorted(keys))
         signal["scoreFamily"] = "financial_similarity"
+        signal["classification"] = "shared_relationship_observation"
+        signal["scoreContribution"] = False
         signals.append(signal)
     return signals
 
@@ -993,6 +1434,497 @@ def _quote_signals(packets: list[Packet]) -> tuple[list[dict[str, Any]], list[di
             )
         )
     return signals, quotes
+
+
+def _transaction_signals(
+    packets: list[Packet],
+    minimum_shared_references: int = 3,
+    minimum_destination_transfers: int = 3,
+    minimum_round_amount_transactions: int = 50,
+    round_amount_threshold: float = 0.95,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    references: dict[str, list[tuple[Packet, dict[str, Any]]]] = defaultdict(list)
+    destinations: dict[str, list[tuple[Packet, dict[str, Any]]]] = defaultdict(list)
+    for packet in packets:
+        for transaction in packet.transactions:
+            if transaction.get("reference"):
+                references[transaction["reference"]].append((packet, transaction))
+            if transaction.get("destinationLast4"):
+                destinations[transaction["destinationLast4"]].append((packet, transaction))
+
+    shared_references = {
+        reference: entries
+        for reference, entries in references.items()
+        if len({normalize_supplier(packet.name) for packet, _ in entries}) > 1
+    }
+    shared_destinations = {
+        account: entries
+        for account, entries in destinations.items()
+        if len({normalize_supplier(packet.name) for packet, _ in entries}) > 1
+    }
+    eligible_references = {
+        reference: entries
+        for reference, entries in shared_references.items()
+        if len({normalize_supplier(packet.name) for packet, _ in entries}) >= 2
+    }
+    borrowers_with_repeated_refs = {
+        normalize_supplier(packet.name)
+        for entries in eligible_references.values()
+        for packet, _ in entries
+    }
+    transfer_matches = {
+        account: entries
+        for account, entries in shared_destinations.items()
+        if len(entries) >= minimum_destination_transfers
+    }
+    borrowers_with_transfer_matches = {
+        normalize_supplier(packet.name)
+        for entries in transfer_matches.values()
+        for packet, _ in entries
+    }
+
+    parent: dict[str, str] = {}
+
+    def find(key: str) -> str:
+        parent.setdefault(key, key)
+        if parent[key] != key:
+            parent[key] = find(parent[key])
+        return parent[key]
+
+    def join(keys: set[str]) -> None:
+        ordered = sorted(keys)
+        for key in ordered[1:]:
+            parent[find(key)] = find(ordered[0])
+
+    for entries in eligible_references.values():
+        join({normalize_supplier(packet.name) for packet, _ in entries})
+    for entries in transfer_matches.values():
+        join({normalize_supplier(packet.name) for packet, _ in entries})
+
+    grouped_borrowers: dict[str, set[str]] = defaultdict(set)
+    for key in borrowers_with_repeated_refs | borrowers_with_transfer_matches:
+        grouped_borrowers[find(key)].add(key)
+
+    packets_by_key = {normalize_supplier(packet.name): packet for packet in packets}
+    signals: list[dict[str, Any]] = []
+    for component in grouped_borrowers.values():
+        component_refs = {
+            reference: entries
+            for reference, entries in eligible_references.items()
+            if {normalize_supplier(packet.name) for packet, _ in entries} <= component
+        }
+        component_destinations = {
+            account: entries
+            for account, entries in transfer_matches.items()
+            if {normalize_supplier(packet.name) for packet, _ in entries} <= component
+        }
+        repeated_across_three = {
+            reference: entries
+            for reference, entries in component_refs.items()
+            if len({normalize_supplier(packet.name) for packet, _ in entries}) >= 3
+        }
+        if len(repeated_across_three) < minimum_shared_references and not component_destinations:
+            continue
+        involved = sorted(
+            {
+                normalize_supplier(packet.name)
+                for entries in (*component_refs.values(), *component_destinations.values())
+                for packet, _ in entries
+            }
+        )
+        records = [
+            {
+                "borrower": packets_by_key[key].name,
+                "borrowerKey": key,
+                "current": True,
+                "dealId": None,
+            }
+            for key in involved
+        ]
+        evidence: list[dict[str, str]] = []
+        if repeated_across_three:
+            all_matching = [
+                (packet, transaction)
+                for entries in repeated_across_three.values()
+                for packet, transaction in entries
+            ]
+            dates_by_reference: dict[str, set[str]] = {
+                reference: {transaction["date"] for _, transaction in entries}
+                for reference, entries in repeated_across_three.items()
+            }
+            synchronized = sum(
+                len(dates) < len(repeated_across_three[reference])
+                for reference, dates in dates_by_reference.items()
+            )
+            sample_refs = ", ".join(sorted(repeated_across_three)[:6])
+            evidence.append(
+                _evidence(
+                    f"{len(repeated_across_three)} distinct transaction references recur "
+                    f"across at least three businesses ({sample_refs}"
+                    f"{', …' if len(repeated_across_three) > 6 else ''}); "
+                    f"{synchronized} have matching posting dates across borrowers.",
+                    all_matching[0][1]["source"],
+                    "shared_transaction_references",
+                )
+            )
+            for reference, entries in list(sorted(repeated_across_three.items()))[:6]:
+                details = "; ".join(
+                    f"{packet.name} on {transaction['date']} for "
+                    f"${transaction['amount']:,.2f}"
+                    for packet, transaction in entries[:3]
+                )
+                evidence.append(
+                    _evidence(
+                        f"Reference {reference}: {details}.",
+                        entries[0][1]["source"],
+                        "transaction_reference_match",
+                    )
+                )
+        for account, entries in sorted(component_destinations.items()):
+            borrowers = sorted({packet.name for packet, _ in entries})
+            total = sum(transaction["amount"] for _, transaction in entries)
+            dates = sorted({transaction["date"] for _, transaction in entries})
+            evidence.append(
+                _evidence(
+                    f"{len(entries)} transfers from {len(borrowers)} businesses route to "
+                    f"destination ending {account}, totaling ${total:,.2f}, across "
+                    f"{len(dates)} posting dates ({', '.join(borrowers)}).",
+                    entries[0][1]["source"],
+                    "shared_transfer_destination",
+                )
+            )
+            for packet, transaction in entries[:3]:
+                evidence.append(
+                    _evidence(
+                        f"{packet.name}: {transaction['date']} "
+                        f"{transaction['description']} ${transaction['amount']:,.2f}.",
+                        transaction["source"],
+                        "transfer_transaction",
+                    )
+                )
+        evidence.append(
+            _evidence(
+                "Repeated references and shared destinations are candidate relationships. "
+                "Confirm invoices, counterparties, and beneficiary accounts independently.",
+                evidence[0]["source"],
+                "transaction_review_caveat",
+            )
+        )
+        signal = _make_signal(
+            f"transaction-cluster-{len(signals) + 1}",
+            "transaction_relationship",
+            "Repeated transaction references and shared destinations",
+            "Multiple borrowers share transaction identifiers or transfer destinations. "
+            "Amounts and timing can differ for legitimate reasons; verify underlying invoices "
+            "and beneficiaries before treating the relationship as suspicious.",
+            "High" if len(repeated_across_three) >= minimum_shared_references else "Elevated",
+            records,
+            evidence,
+            [
+                "Compare original invoices and customer remittance records for matched references.",
+                "Verify destination ownership using independently confirmed bank details.",
+                "Review transaction timing and statement records with an authorized investigator.",
+            ],
+        )
+        signal["scoreFamily"] = "transaction_relationship"
+        signal["transactionSummary"] = {
+            "sharedReferenceCount": len(repeated_across_three),
+            "sharedReferences": sorted(repeated_across_three),
+            "sharedDestinations": sorted(component_destinations),
+            "matchedPostingDates": synchronized if repeated_across_three else 0,
+        }
+        signals.append(signal)
+
+    behavioral: list[dict[str, Any]] = []
+    for packet in packets:
+        transactions = packet.transactions
+        if len(transactions) < minimum_round_amount_transactions:
+            continue
+        rounded = sum(transaction["wholeDollar"] for transaction in transactions)
+        ratio = rounded / len(transactions)
+        if ratio < round_amount_threshold:
+            continue
+        source = transactions[0]["source"]
+        record = {
+            "borrower": packet.name,
+            "borrowerKey": normalize_supplier(packet.name),
+            "current": True,
+            "dealId": None,
+        }
+        behavioral.append(
+            _make_signal(
+                f"round-amount-{len(behavioral) + 1}",
+                "whole_dollar_transactions",
+                "Unusually high whole-dollar transaction share",
+                "Most observed transaction amounts are whole-dollar values. This may reflect "
+                "cash-heavy or batch-payment operations; it is supporting context, not proof of fraud.",
+                "Moderate",
+                [record],
+                [
+                    _evidence(
+                        f"{rounded} of {len(transactions)} extracted transactions "
+                        f"({ratio:.1%}) have whole-dollar amounts. Historical whole-transaction "
+                        "records are not available for a directly comparable baseline.",
+                        source,
+                        "whole_dollar_transaction_ratio",
+                    )
+                ],
+                [
+                    "Compare transaction originals with invoices and settlement records.",
+                    "Interpret this ratio in the context of the borrower's industry and payment channels.",
+                ],
+            )
+        )
+        behavioral[-1]["scoreContribution"] = False
+        behavioral[-1]["riskDimension"] = "behavioral_anomaly"
+        behavioral[-1]["behaviorSeverity"] = "Low"
+    return signals, behavioral
+
+
+def _document_review_signals(
+    packets: list[Packet], root: Path
+) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    current_eins: dict[str, list[tuple[str, Page, str]]] = defaultdict(list)
+    for packet in packets:
+        record = {
+            "borrower": packet.name,
+            "borrowerKey": normalize_supplier(packet.name),
+            "current": True,
+            "dealId": None,
+        }
+        ein_values: dict[str, list[tuple[Page, str]]] = defaultdict(list)
+        legal_names: dict[str, list[tuple[Page, str, str]]] = defaultdict(list)
+        requested_amounts: dict[str, list[tuple[Page, float, str]]] = defaultdict(list)
+        page_totals: dict[Path, tuple[int, int, Page]] = {}
+        financial_values: dict[str, list[tuple[Page, float, str]]] = defaultdict(list)
+        for page in packet.pages:
+            lines = [line.strip() for line in page.text.splitlines()]
+            source = _relative_source(page.path, root, page.number)
+            for match in re.finditer(r"(?<!\d)(\d{2}-\d{7})(?!\d)", page.text):
+                context_start = max(0, match.start() - 100)
+                context_end = min(len(page.text), match.end() + 40)
+                context = page.text[context_start:context_end]
+                if re.search(r"\b(?:EIN|employer identification|federal tax)\b", context, re.I):
+                    ein_values[match.group(1)].append((page, source))
+            for index, line in enumerate(lines):
+                if re.fullmatch(
+                    r"(?:legal business name|name of business|business legal name)",
+                    re.sub(r"\s+", " ", line),
+                    re.I,
+                ):
+                    candidate = next((value for value in lines[index + 1 : index + 4] if value and value != "\ufffd"), "")
+                    if candidate:
+                        legal_names[normalize_supplier(candidate)].append((page, candidate, source))
+            for index, line in enumerate(lines):
+                if re.fullmatch(r"amount requested", re.sub(r"\s+", " ", line), re.I):
+                    candidate = next((value for value in lines[index + 1 : index + 4] if value), "")
+                    amount_match = re.search(r"\$?\s*([\d,]+(?:\.\d{2})?)", candidate)
+                    if amount_match:
+                        value = float(amount_match.group(1).replace(",", ""))
+                        requested_amounts["application"].append((page, value, source))
+                request_match = re.search(
+                    r"\b(?:requesting|request(?:ed)? amount|loan request)\b[^\n$]{0,50}\$([\d,]+(?:\.\d{2})?)",
+                    line,
+                    re.I,
+                )
+                if request_match:
+                    value = float(request_match.group(1).replace(",", ""))
+                    requested_amounts["supporting_letter"].append((page, value, source))
+                if re.search(r"\bFY\s*2025\b", page.text, re.I) and re.fullmatch(
+                    r"(?:revenue|gross receipts|total income)", line, re.I
+                ):
+                    candidate = next((value for value in lines[index + 1 : index + 4] if value), "")
+                    amount_match = re.fullmatch(r"\$?([\d,]+(?:\.\d{2})?)", candidate)
+                    if amount_match:
+                        value = float(amount_match.group(1).replace(",", ""))
+                        financial_values["FY2025 revenue"].append((page, value, source))
+            for match in re.finditer(r"\bPage\s+(\d+)\s+of\s+(\d+)\b", page.text, re.I):
+                page_number, expected = int(match.group(1)), int(match.group(2))
+                current = page_totals.get(page.path)
+                if current is None or expected > current[1]:
+                    page_totals[page.path] = (page_number, expected, page)
+
+        ein_distinct = len(ein_values)
+        for value, occurrences in ein_values.items():
+            current_eins[value].extend(
+                (packet.name, page, source) for page, source in occurrences
+            )
+        if ein_distinct > 1:
+            evidence = [
+                _evidence(
+                    f"EIN {value} appears in {page.path.name}.",
+                    source,
+                    "document_ein",
+                )
+                for value, occurrences in ein_values.items()
+                for page, source in occurrences[:1]
+            ]
+            findings.append(
+                _make_signal(
+                    f"document-ein-{len(findings) + 1}",
+                    "document_reconciliation",
+                    "Business EIN differs across submitted documents",
+                    "The application packet contains more than one EIN. This is a document "
+                    "inconsistency requiring clarification, not a finding of identity fraud.",
+                    "Moderate",
+                    [record],
+                    evidence,
+                    ["Confirm the correct EIN against independently verified IRS records."],
+                )
+            )
+            findings[-1]["classification"] = "document_review_issue"
+            findings[-1]["scoreContribution"] = False
+        if len(legal_names) > 1:
+            evidence = [
+                _evidence(
+                    f"Document lists business name {name}.",
+                    source,
+                    "document_legal_name",
+                )
+                for occurrences in legal_names.values()
+                for _, name, source in occurrences[:1]
+            ]
+            findings.append(
+                _make_signal(
+                    f"document-legal-name-{len(findings) + 1}",
+                    "document_reconciliation",
+                    "Business names differ across submitted documents",
+                    "Documents contain different normalized legal business names. Confirm "
+                    "whether the difference reflects a trade name, a legal-name change, or a record error.",
+                    "Moderate",
+                    [record],
+                    evidence,
+                    ["Confirm the current legal entity name against independently verified registration records."],
+                )
+            )
+            findings[-1]["classification"] = "document_review_issue"
+            findings[-1]["scoreContribution"] = False
+
+        app_amounts = requested_amounts.get("application", [])
+        support_amounts = requested_amounts.get("supporting_letter", [])
+        if app_amounts and support_amounts:
+            app_value = app_amounts[0][1]
+            conflicts = [item for item in support_amounts if abs(item[1] - app_value) > 0.01]
+            if conflicts:
+                page, value, source = app_amounts[0]
+                evidence = [
+                    _evidence(f"Application amount requested: ${app_value:,.2f}.", source, "application_amount"),
+                    *[
+                        _evidence(
+                            f"Supporting document amount requested: ${other:,.2f}.",
+                            other_source,
+                            "supporting_letter_amount",
+                        )
+                        for _, other, other_source in conflicts
+                    ],
+                ]
+                findings.append(
+                    _make_signal(
+                        f"document-amount-{len(findings) + 1}",
+                        "document_reconciliation",
+                        "Requested loan amounts differ across documents",
+                        "The application and a supporting request document list different amounts. "
+                        "Confirm the intended request; a discrepancy is not proof of fraud.",
+                        "Moderate",
+                        [record],
+                        evidence,
+                        ["Confirm the requested amount with the borrower using the verified contact on file."],
+                    )
+                )
+                findings[-1]["classification"] = "document_review_issue"
+                findings[-1]["scoreContribution"] = False
+
+        for path, (page_number, expected, page) in page_totals.items():
+            actual_pages = sum(item.path == path for item in packet.pages)
+            if expected > actual_pages:
+                findings.append(
+                    _make_signal(
+                        f"document-pages-{len(findings) + 1}",
+                        "document_completeness",
+                        "A document appears to be missing pages",
+                        "The file's own page numbering indicates more pages than were received. "
+                        "This is an incomplete-document issue, not evidence of fraud.",
+                        "Moderate",
+                        [record],
+                        [
+                            _evidence(
+                                f"{path.name} labels this as page {page_number} of {expected}, "
+                                f"but the PDF contains {actual_pages} page(s).",
+                                _relative_source(page.path, root, page.number),
+                                "incomplete_document_pages",
+                            )
+                        ],
+                        ["Request the complete document before relying on its transaction detail."],
+                    )
+                )
+                findings[-1]["classification"] = "document_review_issue"
+                findings[-1]["scoreContribution"] = False
+
+        values = financial_values.get("FY2025 revenue", [])
+        if len(values) > 1 and max(value for _, value, _ in values) - min(
+            value for _, value, _ in values
+        ) > 0.01:
+            evidence = [
+                _evidence(
+                    f"FY2025 revenue: ${value:,.2f}.",
+                    source,
+                    "financial_period_reconciliation",
+                )
+                for _, value, source in values
+            ]
+            findings.append(
+                _make_signal(
+                    f"document-financial-{len(findings) + 1}",
+                    "document_reconciliation",
+                    "FY2025 revenue differs across financial documents",
+                    "Submitted financial documents report different values for the same revenue "
+                    "period. Verify source statements and reporting definitions before drawing conclusions.",
+                    "Moderate",
+                    [record],
+                    evidence,
+                    ["Reconcile values with the borrower or preparer and retain the source documents."],
+                )
+            )
+            findings[-1]["classification"] = "document_review_issue"
+            findings[-1]["scoreContribution"] = False
+    for ein, occurrences in current_eins.items():
+        borrowers = sorted({borrower for borrower, _, _ in occurrences})
+        if len(borrowers) < 2:
+            continue
+        records = [
+            {
+                "borrower": borrower,
+                "borrowerKey": normalize_supplier(borrower),
+                "current": True,
+                "dealId": None,
+            }
+            for borrower in borrowers
+        ]
+        evidence = [
+            _evidence(
+                f"EIN {ein} appears in documents for {borrower}.",
+                source,
+                "cross_application_ein",
+            )
+            for borrower, _, source in occurrences
+        ]
+        findings.append(
+            _make_signal(
+                f"cross-application-ein-{len(findings) + 1}",
+                "document_reconciliation",
+                "The same EIN appears across different current applicants",
+                "A federal EIN appears in documents for multiple applicants. Verify entity "
+                "ownership and the source documents; shared control or a data-entry error can be legitimate.",
+                "Moderate",
+                records,
+                evidence,
+                ["Verify each applicant's EIN and legal entity using independently sourced records."],
+            )
+        )
+        findings[-1]["classification"] = "document_review_issue"
+        findings[-1]["scoreContribution"] = False
+    return findings
 
 
 def _financial_signals(packets: list[Packet], root: Path) -> list[dict[str, Any]]:
@@ -1078,40 +2010,115 @@ def _deposit_behavior_signals(
     historical_behavior: list[dict[str, Any]],
     root: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    history_values = sorted(
-        row["meanRoundDepositPct"] for row in historical_behavior
-    )
+    history_by_industry: dict[str, list[float]] = defaultdict(list)
+    history_values: list[float] = []
+    for row in historical_behavior:
+        value = row["meanRoundDepositPct"]
+        history_values.append(value)
+        if row.get("industry"):
+            history_by_industry[row["industry"]].append(value)
     if len(history_values) < 20:
         return [], {"available": False, "reason": "Insufficient historical reference deals."}
-    percentile_index = min(len(history_values) - 1, int(0.95 * (len(history_values) - 1)))
-    threshold = history_values[percentile_index]
+
+    def percentile(values: list[float], value: float) -> float:
+        return sum(item <= value for item in values) / len(values) * 100
+
+    def threshold_for(values: list[float]) -> float:
+        ordered = sorted(values)
+        index = min(len(ordered) - 1, math.ceil(0.95 * len(ordered)) - 1)
+        return ordered[index]
+
     signals: list[dict[str, Any]] = []
     evaluated = 0
+    industry_comparisons = 0
     for packet in packets:
-        monthly = _deposit_amounts(packet.pages)
-        usable = {month: values for month, values in monthly.items() if values}
-        total = sum(len(values) for values in usable.values())
+        monthly_transactions: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for transaction in packet.transactions:
+            if transaction["direction"] == "credit":
+                monthly_transactions[transaction["date"][:7]].append(transaction)
+        usable = {
+            month: transactions
+            for month, transactions in monthly_transactions.items()
+            if transactions
+        }
+        total = sum(len(transactions) for transactions in usable.values())
         if len(usable) < 3 or total < 10:
             continue
         evaluated += 1
-        round_counts = [
-            sum(
-                1 for amount in values
-                if abs(amount / 100 - round(amount / 100)) < 1e-9
-            )
-            for values in usable.values()
-        ]
+        round_counts = {
+            month: sum(transaction["wholeDollar"] for transaction in transactions)
+            for month, transactions in usable.items()
+        }
         monthly_rates = [
-            count / len(values)
-            for count, values in zip(round_counts, usable.values())
+            round_counts[month] / len(transactions)
+            for month, transactions in usable.items()
         ]
-        round_count = sum(round_counts)
+        round_count = sum(round_counts.values())
         observed = sum(monthly_rates) / len(monthly_rates)
+
+        industry_text = _application_field_value(
+            packet,
+            r"Industry(?:\s*\(NAICS\))?",
+        )
+        industry_match = re.search(r"\b(\d{6})\b", industry_text)
+        industry_key = industry_match.group(1) if industry_match else ""
+        peer_values = history_by_industry.get(industry_key, [])
+        use_industry_peers = len(peer_values) >= 5
+        comparison_values = peer_values if use_industry_peers else history_values
+        threshold = threshold_for(comparison_values)
+        observed_percentile = percentile(comparison_values, observed)
+        industry_comparisons += int(use_industry_peers)
         if observed <= threshold:
             continue
-        source_page = next(
-            page for page in packet.pages
-            if _deposit_amounts([page])
+
+        channel_counts: dict[str, int] = defaultdict(int)
+        evidence = []
+        for month, transactions in sorted(usable.items()):
+            for transaction in transactions:
+                description = transaction["description"].casefold()
+                channel = (
+                    "wire"
+                    if "wire" in description
+                    else "ACH"
+                    if "ach" in description
+                    else "branch/cash"
+                    if any(term in description for term in ("branch", "cash"))
+                    else "other credit"
+                )
+                channel_counts[channel] += 1
+            extracted_transactions = "; ".join(
+                f"{transaction['date']} {transaction['description']} "
+                f"${transaction['amount']:,.2f}"
+                for transaction in transactions
+            )
+            sources = sorted({transaction["source"] for transaction in transactions})
+            evidence.append(
+                _evidence(
+                    f"{month}: {len(transactions)} extracted credits, "
+                    f"{round_counts[month]} with whole-dollar amounts. "
+                    f"Transactions: {extracted_transactions}.",
+                    sources[0],
+                    "monthly_deposit_transactions",
+                )
+            )
+        channel_summary = ", ".join(
+            f"{channel}: {count}" for channel, count in sorted(channel_counts.items())
+        )
+        if evidence:
+            evidence.append(
+                _evidence(
+                    f"Current deposit channels across these statements: {channel_summary}. "
+                    "Historical files contain monthly aggregate deposits, not transaction "
+                    "descriptions, so a historical channel-matched comparison is unavailable.",
+                    evidence[0]["source"],
+                    "deposit_channel_limit",
+                )
+            )
+        peer_scope = (
+            f"the same industry (NAICS {industry_key}, {len(comparison_values)} deals)"
+            if use_industry_peers
+            else f"all available industries ({len(comparison_values)} deals); fewer than "
+            f"5 same-industry records were available for NAICS {industry_key or 'unknown'}"
         )
         record = {
             "borrower": packet.name,
@@ -1119,42 +2126,65 @@ def _deposit_behavior_signals(
             "current": True,
             "dealId": None,
         }
-        signals.append(
-            _make_signal(
-                f"deposit-behavior-{len(signals) + 1}",
-                "deposit_behavior",
-                "Round-number deposit behavior outside historical range",
-                "The share of observed deposits divisible by $100 exceeds the 95th percentile "
-                "of historical deal-level averages. This is a behavioral outlier only and is not "
-                "evidence of fraud or repayment trouble.",
-                "Moderate",
-                [record],
-                [
-                    _evidence(
-                        f"{round_count} of {total} deposits across {len(usable)} statement months "
-                        f"({round_count / total:.1%} aggregate) are multiples of $100; mean "
-                        f"monthly rate is {observed:.1%}, versus the historical 95th-percentile "
-                        f"reference of {threshold:.1%}.",
-                        _relative_source(source_page.path, root, source_page.number),
-                        "deposit_behavior",
-                    )
-                ],
-                [
-                    "Compare deposit entries with invoices and point-of-sale records.",
-                    "Review the full statement context; do not make an adverse decision from this feature.",
-                ],
-            )
+        signal = _make_signal(
+            f"deposit-behavior-{len(signals) + 1}",
+            "deposit_behavior",
+            "Round-number deposit behavior outside historical range",
+            f"The mean monthly share of whole-dollar deposits exceeds the 95th percentile "
+            f"of historical deal-level averages for {peer_scope}. This is a behavioral "
+            "anomaly only, not evidence of fraud or repayment trouble. Historical data "
+            "does not contain transaction descriptions for channel-matched comparisons.",
+            "Moderate",
+            [record],
+            [
+                _evidence(
+                    f"{round_count} of {total} extracted credits across {len(usable)} "
+                    f"statement months are whole-dollar amounts. The deal-level mean of "
+                    f"monthly rates is {observed:.1%}, versus a same-industry (NAICS "
+                    f"{industry_key or 'unknown'}) historical median of "
+                    f"{sum(comparison_values) / len(comparison_values):.1%} and 95th "
+                    f"percentile of {threshold:.1%} ({len(comparison_values)} prior deals). "
+                    f"This ranks at the {observed_percentile:.1f}th percentile.",
+                    evidence[0]["source"] if evidence else packet.source_name,
+                    "deposit_behavior_cohort",
+                ),
+                *evidence,
+            ],
+            [
+                "Compare deposit entries with invoices and point-of-sale records.",
+                "Compare like deposit channels and industry peers; the historical dataset does not contain transaction-level channel descriptions.",
+                "Do not make an adverse decision from this behavioral feature alone.",
+            ],
         )
+        signal["scoreContribution"] = False
+        signal["riskDimension"] = "behavioral_anomaly"
+        signal["behaviorSeverity"] = (
+            "High" if observed_percentile >= 99 else "Moderate"
+        )
+        signal["depositBehavior"] = {
+            "industryCode": industry_key or None,
+            "industryPeerCount": len(peer_values),
+            "comparisonDealCount": len(comparison_values),
+            "comparisonScope": "industry" if use_industry_peers else "all_industries",
+            "dealLevelMean": observed,
+            "historicalMedian": sum(comparison_values) / len(comparison_values),
+            "historical95thPercentile": threshold,
+            "observedPercentile": observed_percentile,
+            "channelBreakdown": dict(channel_counts),
+            "historicalChannelComparisonAvailable": False,
+        }
+        signals.append(signal)
     return signals, {
         "available": True,
         "historicalDeals": len(history_values),
         "referencePercentile": 95,
-        "threshold": threshold,
+        "industrySpecificComparisons": industry_comparisons,
         "currentPacketsEvaluated": evaluated,
         "method": (
-            "Current statement transactions are evaluated only with at least three months "
-            "and ten qualifying deposits; compare deal-level round-deposit proportions with "
-            "the empirical historical 95th percentile."
+            "Current mean monthly whole-dollar deposit share is compared against the "
+            "historical 95th percentile of per-deal monthly averages. Use same-NAICS peers "
+            "when at least five are available; otherwise disclose the all-industry fallback. "
+            "Historical transaction-type descriptions are unavailable."
         ),
     }
 
@@ -1184,34 +2214,222 @@ def _repayment_behavior_cohorts(
     return cohorts
 
 
+SCORE_FAMILY_LABELS = {
+    "supplier_relationship": "Supplier/payment relationships",
+    "transaction_relationship": "Cross-business transaction links",
+    "financial_similarity": "Matching financial values",
+    "document_identifier": "Document identifier patterns",
+    "deposit_behavior": "Deposit behavior",
+}
+SCORE_FAMILY_ORDER = (
+    "supplier_relationship",
+    "transaction_relationship",
+    "financial_similarity",
+    "document_identifier",
+    "deposit_behavior",
+)
+
+
+def _family_score_details(
+    family_signals: list[dict[str, Any]],
+) -> dict[str, Any]:
+    severity_points = {"Moderate": 3, "Elevated": 8, "High": 13}
+    severity = max(
+        (signal.get("severity", "Moderate") for signal in family_signals),
+        key=lambda value: severity_points.get(value, 3),
+    )
+    base_points = severity_points.get(severity, 3)
+    evidence = [
+        item
+        for signal in family_signals
+        for item in signal.get("evidence", [])
+    ]
+    source_documents = {
+        re.sub(r":(?:page|line)\s+\d+.*$", "", item.get("source", ""), flags=re.I)
+        for item in evidence
+        if item.get("source")
+    }
+    evidence_types = {
+        item.get("kind", "")
+        for item in evidence
+        if item.get("kind")
+        and "caveat" not in item.get("kind", "").casefold()
+        and "template_control" not in item.get("kind", "").casefold()
+    }
+    borrowers = {
+        normalize_supplier(borrower)
+        for signal in family_signals
+        for borrower in signal.get("borrowers", [])
+    }
+    source_bonus = min(8, max(0, len(source_documents) - 1) * 2)
+    evidence_type_bonus = min(4, max(0, len(evidence_types) - 1) * 2)
+    borrower_bonus = 3 if len(borrowers) >= 3 else 1 if len(borrowers) == 2 else 0
+    raw_points = base_points + source_bonus + evidence_type_bonus + borrower_bonus
+    points = min(25, raw_points)
+    urgency = (
+        "Low" if points <= 5
+        else "Moderate" if points <= 10
+        else "Elevated" if points <= 15
+        else "High" if points <= 20
+        else "Urgent"
+    )
+    rationale_parts = [
+        f"{severity} signal severity +{base_points}",
+        f"{len(source_documents)} distinct source documents +{source_bonus}",
+        f"{len(evidence_types)} corroborating evidence types +{evidence_type_bonus}",
+        f"{len(borrowers)} connected applicants +{borrower_bonus}",
+        f"{'capped at 25' if raw_points > 25 else f'total {points}/25'}",
+    ]
+    return {
+        "points": points,
+        "urgency": urgency,
+        "rationale": "; ".join(rationale_parts),
+    }
+
+
 def _risk_scores(signals: list[dict[str, Any]], packets: list[Packet]) -> dict[str, dict[str, Any]]:
-    families_by_borrower: dict[str, set[str]] = defaultdict(set)
+    signals_by_borrower: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
     for signal in signals:
-        if not signal.get("scoreContribution", True):
+        if (
+            not signal.get("scoreContribution", True)
+            or signal.get("riskDimension") == "behavioral_anomaly"
+        ):
             continue
+        family = signal.get("scoreFamily", signal["family"])
         for borrower in signal["borrowers"]:
-            families_by_borrower[normalize_supplier(borrower)].add(
-                signal.get("scoreFamily", signal["family"])
-            )
+            signals_by_borrower[normalize_supplier(borrower)][family].append(signal)
+
     family_count = 4
+    order = {family: index for index, family in enumerate(SCORE_FAMILY_ORDER)}
     scores: dict[str, dict[str, Any]] = {}
     for packet in packets:
         key = normalize_supplier(packet.name)
-        families = sorted(families_by_borrower.get(key, set()))
+        family_signals = signals_by_borrower.get(key, {})
+        families = set(family_signals)
+        if families == {"document_identifier"}:
+            families.clear()
+        ordered_families = sorted(
+            families,
+            key=lambda family: (order.get(family, len(order)), family),
+        )
+        counted_families = ordered_families[:family_count]
+        breakdown = []
+        for family in counted_families:
+            family_score = _family_score_details(family_signals[family])
+            breakdown.append({
+                "family": family,
+                "label": SCORE_FAMILY_LABELS.get(
+                    family,
+                    family.replace("_", " ").capitalize(),
+                ),
+                **family_score,
+                "signals": [
+                    {
+                        "id": signal["id"],
+                        "title": signal["title"],
+                        "evidence": signal["evidence"][:3],
+                    }
+                    for signal in family_signals[family]
+                ],
+            })
         scores[key] = {
             "borrower": packet.name,
-            "score": round(100 * min(len(families), family_count) / family_count),
-            "families": families,
+            "folder": getattr(packet, "folder", None),
+            "score": sum(item["points"] for item in breakdown),
+            "families": counted_families,
+            "additionalFamilies": ordered_families[family_count:],
+            "scoreBreakdown": breakdown,
             "method": (
-                "Uncalibrated review-priority index: 25 points per distinct scoring family, "
-                "capped at four. Supplier account reuse, name variation, concentration, and "
-                "account-history differences count once; financial-value and expense-structure "
-                "similarity count once. Shared-preparer links are informational and add no points "
-                "without independent evidence. Historical fraud labels and operational delays "
-                "do not contribute."
+                "Uncalibrated novel-evidence review index: each distinct family receives "
+                "1–25 points from signal severity and corroboration across source documents, "
+                "evidence types, and connected applicants; capped at four families. "
+                "Behavioral anomalies, document discrepancies, known bank-rule triggers, "
+                "historical labels, and operational delays do not contribute."
             ),
         }
     return scores
+
+
+def _investigations(
+    signals: list[dict[str, Any]], scores: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    parent: dict[str, str] = {}
+
+    def find(key: str) -> str:
+        parent.setdefault(key, key)
+        if parent[key] != key:
+            parent[key] = find(parent[key])
+        return parent[key]
+
+    for signal in signals:
+        borrowers = sorted({normalize_supplier(name) for name in signal["borrowers"]})
+        for key in borrowers[1:]:
+            parent[find(key)] = find(borrowers[0])
+
+    component_signals: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for index, signal in enumerate(signals):
+        keys = sorted({normalize_supplier(name) for name in signal["borrowers"]})
+        root = find(keys[0]) if keys else f"unlinked-{index}"
+        component_signals[root].append(signal)
+
+    severity_rank = {"Moderate": 1, "Elevated": 2, "High": 3}
+    investigations: list[dict[str, Any]] = []
+    for index, group in enumerate(
+        sorted(
+            component_signals.values(),
+            key=lambda items: sorted(
+                normalize_supplier(name)
+                for signal in items
+                for name in signal["borrowers"]
+            ),
+        ),
+        start=1,
+    ):
+        borrowers = sorted(
+            {
+                name
+                for signal in group
+                for name in signal["borrowers"]
+            }
+        )
+        related_scores = [
+            scores.get(normalize_supplier(name), {}).get("score", 0)
+            for name in borrowers
+        ]
+        investigation_signals = [
+            signal for signal in group
+            if signal.get("riskDimension") != "behavioral_anomaly"
+        ]
+        severity = max(
+            (signal["severity"] for signal in investigation_signals),
+            key=lambda value: severity_rank.get(value, 0),
+            default="Moderate",
+        )
+        investigation_id = f"investigation-{index:02d}"
+        for signal in group:
+            signal["investigationId"] = investigation_id
+        investigations.append(
+            {
+                "id": investigation_id,
+                "title": (
+                    "Connected review cluster"
+                    if len(borrowers) > 1
+                    else f"Application review: {borrowers[0]}"
+                    if borrowers
+                    else "Unlinked review"
+                ),
+                "severity": severity,
+                "borrowers": borrowers,
+                "signalIds": [signal["id"] for signal in group],
+                "patterns": [signal["title"] for signal in group],
+                "priorityScore": max(related_scores, default=0),
+                "scoreIsProbability": False,
+                "severityBasis": "Investigation evidence; behavioral anomaly severity is reported separately.",
+            }
+        )
+    return investigations
 
 
 def _node(node_id: str, label: str, kind: str, **extra: Any) -> dict[str, Any]:
@@ -1231,6 +2449,8 @@ def _graph(
     financial_signals: list[dict[str, Any]],
     payment_signals: list[dict[str, Any]],
     deposit_signals: list[dict[str, Any]],
+    transaction_signals: list[dict[str, Any]],
+    behavioral_signals: list[dict[str, Any]],
     supplementary_signals: list[dict[str, Any]],
     root: Path,
 ) -> dict[str, list[dict[str, Any]]]:
@@ -1468,6 +2688,71 @@ def _graph(
                     evidence, signal["id"]
                 )
 
+    for signal in transaction_signals:
+        summary = signal.get("transactionSummary", {})
+        reference_ids = set(summary.get("sharedReferences", []))
+        destinations = set(summary.get("sharedDestinations", []))
+        for borrower in signal["borrowers"]:
+            key = normalize_supplier(borrower)
+            app_id = app_id_by_key.get(key)
+            packet = packet_by_key.get(key)
+            if not app_id or not packet:
+                continue
+            for transaction in packet.transactions:
+                reference = transaction.get("reference")
+                if reference in reference_ids:
+                    node_id = f"transaction-reference:{reference.casefold()}"
+                    nodes.setdefault(
+                        node_id,
+                        _node(node_id, reference, "transaction_reference"),
+                    )
+                    add_edge(
+                        app_id,
+                        node_id,
+                        "shares_transaction_reference",
+                        transaction["source"],
+                        signal["id"],
+                    )
+                destination = transaction.get("destinationLast4")
+                if destination in destinations:
+                    node_id = f"transaction-destination:{destination}"
+                    nodes.setdefault(
+                        node_id,
+                        _node(
+                            node_id,
+                            f"Transfer destination ending {destination}",
+                            "payment_destination",
+                        ),
+                    )
+                    add_edge(
+                        app_id,
+                        node_id,
+                        "transfers_to_shared_destination",
+                        transaction["source"],
+                        signal["id"],
+                    )
+
+    for signal in behavioral_signals:
+        pattern_id = f"behavior-pattern:{signal['id']}"
+        nodes[pattern_id] = _node(
+            pattern_id, signal["title"], "behavioral_pattern"
+        )
+        relationship = (
+            "whole_dollar_transaction_outlier"
+            if signal["family"] == "whole_dollar_transactions"
+            else "deposit_behavior_outlier"
+        )
+        for borrower in signal["borrowers"]:
+            app_id = app_id_by_key.get(normalize_supplier(borrower))
+            if app_id:
+                add_edge(
+                    app_id,
+                    pattern_id,
+                    relationship,
+                    signal["evidence"][0]["source"],
+                    signal["id"],
+                )
+
     for signal in supplementary_signals:
         if signal["family"] == "supplier_name_variation":
             pattern_id = f"supplier-name-candidate:{signal['entityKey'].replace(' ', '-')}"
@@ -1483,6 +2768,10 @@ def _graph(
                 if signal["family"] == "supplier_concentration"
                 else "preparer_network"
                 if signal["family"] == "preparer_network"
+                else "ml_anomaly"
+                if signal["family"] == "ml_anomaly"
+                else "document_review"
+                if signal["family"] in {"document_reconciliation", "document_completeness"}
                 else "financial_pattern"
             )
             label = (
@@ -1584,21 +2873,29 @@ def analyze(data_root: Path) -> dict[str, Any]:
         packets, historical_preparer_records, data_root
     )
     quote_signals, _ = _quote_signals(packets)
+    transaction_signals, whole_dollar_signals = _transaction_signals(packets)
+    document_review_signals = _document_review_signals(packets, data_root)
     financial_signals = _financial_signals(packets, data_root)
     financial_structure_signals = _financial_structure_signals(packets, data_root)
     financial_signals.extend(financial_structure_signals)
 
     historical_behavior: list[dict[str, Any]] = []
+    monthly_rows: list[dict[str, str]] = []
     monthly_path = history_dir / "monthly_deposits.csv"
     if monthly_path.is_file():
-        with (history_dir / "deals.csv").open(
-            encoding="utf-8-sig", newline=""
-        ) as stream:
-            historical_rows = list(csv.DictReader(stream))
-        repayment_by_id = {row["deal_id"]: row.get("repayment_status", "") for row in historical_rows}
+        industry_by_deal = {
+            row.get("deal_id", ""): row.get("naics") or row.get("industry", "")
+            for row in deals
+        }
+        repayment_by_id = {
+            row["deal_id"]: row.get("repayment_status", "")
+            for row in deals
+            if row.get("deal_id")
+        }
         monthly: dict[str, list[float]] = defaultdict(list)
         with monthly_path.open(encoding="utf-8-sig", newline="") as stream:
-            for row in csv.DictReader(stream):
+            monthly_rows = list(csv.DictReader(stream))
+            for row in monthly_rows:
                 try:
                     monthly[row["deal_id"]].append(
                         float(row["pct_deposits_multiple_of_100"])
@@ -1610,10 +2907,14 @@ def analyze(data_root: Path) -> dict[str, Any]:
                 "deal_id": deal_id,
                 "meanRoundDepositPct": sum(values) / len(values),
                 "repaymentStatus": repayment_by_id.get(deal_id, ""),
+                "industry": industry_by_deal.get(deal_id, ""),
             }
             for deal_id, values in monthly.items()
             if values
         ]
+    historical_model_rows = _historical_ml_features(deals, monthly_rows)
+    ml_model = train_historical_anomaly_model(historical_model_rows)
+    ml_signals, ml_scores = _ml_anomaly_signals(packets, ml_model, data_root)
     deposit_signals, behavior_baseline = _deposit_behavior_signals(
         packets, historical_behavior, data_root
     )
@@ -1622,17 +2923,26 @@ def analyze(data_root: Path) -> dict[str, Any]:
         + supplier_concentration_signals
         + preparer_signals
         + financial_structure_signals
+        + document_review_signals
+        + ml_signals
     )
     signals = (
         payment_signals
         + supplier_name_signals
         + supplier_concentration_signals
         + quote_signals
+        + transaction_signals
         + financial_signals
         + preparer_signals
         + deposit_signals
+        + whole_dollar_signals
+        + document_review_signals
+        + ml_signals
     )
     scores = _risk_scores(signals, packets)
+    for borrower_key, ml_score in ml_scores.items():
+        scores[borrower_key]["mlAnomaly"] = ml_score
+    investigations = _investigations(signals, scores)
     graph = _graph(
         packets,
         historical_payments,
@@ -1641,6 +2951,8 @@ def analyze(data_root: Path) -> dict[str, Any]:
         financial_signals,
         payment_signals,
         deposit_signals,
+        transaction_signals,
+        whole_dollar_signals,
         supplementary_signals,
         data_root,
     )
@@ -1664,6 +2976,9 @@ def analyze(data_root: Path) -> dict[str, Any]:
             "historicalDeals": len(deals),
             "currentPackets": len(packets),
             "crossDealSignals": len(signals),
+            "documentReviewFindings": len(document_review_signals),
+            "mlAnomalyFindings": len(ml_signals),
+            "investigations": len(investigations),
             "linkedApplications": len(
                 {name for signal in signals for name in signal["borrowers"]}
             ),
@@ -1671,18 +2986,24 @@ def analyze(data_root: Path) -> dict[str, Any]:
             "graphRelationships": len(graph["edges"]),
         },
         "baseline": baseline,
+        "mlModel": ml_model.metadata(
+            scored_applications=len(ml_scores),
+            outlier_applications=len(ml_signals),
+        ),
         "scoreMethod": (
-            "Uncalibrated review-priority index: 25 points per distinct scoring family, "
-            "capped at four (supplier relationships, document identifiers, financial "
-            "similarity, and deposit behavior). Supplier account reuse, "
-            "name variation, concentration, and account history count once; financial-value "
-            "and expense-structure similarity count once. Shared-preparer relationships and "
-            "other shared-relationship observations are shown but add no points without "
-            "independent evidence. This is not a probability of fraud and is not trained on "
-            "historical fraud labels."
+            "Uncalibrated review-priority index: each distinct scoring family receives "
+            "1–25 points based on the strongest signal severity, distinct source documents, "
+            "corroborating evidence types, and connected applicants; capped at four families. "
+            "Supplier account reuse, name variation, concentration, and account history count "
+            "once; financial-value and expense-structure similarity count once. Behavioral "
+            "anomalies, document inconsistencies, and whole-dollar patterns are informational "
+            "and add no points. Shared-preparer relationships and other shared-relationship "
+            "observations add no points without independent evidence. "
+            "This is not a probability of fraud and is not trained on historical fraud labels."
         ),
         "scores": list(scores.values()),
         "signals": signals,
+        "investigations": investigations,
         "behavior": _behavior_reference(signals, behavior_baseline),
         "graph": graph,
     }

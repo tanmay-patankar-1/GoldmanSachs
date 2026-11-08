@@ -66,7 +66,7 @@ type ViewId = (typeof navItems)[number]['id'] | 'audit' | 'history' | 'users'
 type DetailTab = 'Overview' | 'Documents' | 'Activity'
 type Signal = CrossDealSignal & {
   loanIds: string[]
-  reviewIndex: number
+  reviewIndex: number | null
 }
 type ActionForm = { note: string; product?: string; pricing?: string }
 type PendingAction = { loan: Loan; actionLabel: string; action: string }
@@ -133,6 +133,33 @@ function findLoanForBorrower(name: string, loans: Loan[]) {
   )
 }
 
+function findAnalysisScore(
+  scores: FraudAnalysis['scores'],
+  borrowerNames: string[],
+  folder?: string,
+) {
+  const folderMatch = folder
+    ? scores.find((score) => score.folder === folder)
+    : undefined
+  if (folderMatch) return folderMatch
+
+  const normalizedNames = borrowerNames
+    .map(normalizeBorrowerName)
+    .filter(Boolean)
+  const exactMatch = scores.find((score) =>
+    normalizedNames.includes(normalizeBorrowerName(score.borrower)),
+  )
+  if (exactMatch) return exactMatch
+
+  const candidates = scores.filter((score) => {
+    const borrower = normalizeBorrowerName(score.borrower)
+    return normalizedNames.some((name) =>
+      borrower.includes(name) || name.includes(borrower),
+    )
+  })
+  return candidates.length === 1 ? candidates[0] : undefined
+}
+
 function getApplicationValue(
   application: NonNullable<Loan['workflow']>['application'],
   key: string,
@@ -145,6 +172,8 @@ const riskTone: Record<RiskLevel, string> = {
   Moderate: 'moderate',
   Elevated: 'elevated',
   High: 'high',
+  'No scored lead': 'unassessed',
+  'Not assessed': 'unassessed',
 }
 
 function App() {
@@ -244,34 +273,45 @@ function DealPilotApp({
     const accents = ['blue', 'violet', 'amber', 'teal', 'orange']
     return workflow.loans.map((item, index): Loan => {
       const application = item.application
-      const borrowerScore = fraudAnalysis?.scores.find(
-        (score) =>
-          normalizeBorrowerName(score.borrower) ===
-          normalizeBorrowerName(item.borrower),
-      )?.score ?? 0
+      const borrowerScoreRecord = fraudAnalysis
+        ? findAnalysisScore(
+            fraudAnalysis.scores,
+            [item.borrower, application.legalName?.value ?? ''],
+            item.folder,
+          )
+        : undefined
+      const fullName = application.legalName?.value
+        || (item.borrower === item.folder ? borrowerScoreRecord?.borrower : undefined)
+        || item.borrower
+      const borrowerAliases = new Set([
+        normalizeBorrowerName(fullName),
+        normalizeBorrowerName(borrowerScoreRecord?.borrower ?? ''),
+      ])
       const flaggedChecks = item.checks.filter((check) => check.status === 'flagged')
       const relatedSignals = fraudAnalysis?.signals.filter((signal) =>
         signal.borrowers.some(
-          (borrower) =>
-            normalizeBorrowerName(borrower) === normalizeBorrowerName(item.borrower),
+          (borrower) => borrowerAliases.has(normalizeBorrowerName(borrower)),
         ),
       ) ?? []
-      const riskScore = Math.max(
-        borrowerScore,
-        flaggedChecks.length > 0 ? 65 : 0,
-      )
-      const risk: RiskLevel =
-        riskScore >= 75 ? 'High' :
-          riskScore >= 50 ? 'Elevated' :
-            riskScore >= 20 ? 'Moderate' : 'Low'
+      const riskScore = borrowerScoreRecord?.score ?? null
       const requirements = item.requiredDocuments
       const missingDocuments = requirements
         .filter((document) => document.status !== 'received')
         .map((document) => document.label)
+      const incompleteInputs = missingDocuments.length > 0
+        || item.checks.length !== 5
+        || item.checks.some((check) => check.status === 'not_evaluable')
+      const risk: RiskLevel =
+        riskScore === null ? 'Not assessed' :
+          riskScore === 0 && incompleteInputs ? 'Not assessed' :
+            riskScore === 0 ? 'No scored lead' :
+            riskScore >= 76 ? 'High' :
+              riskScore >= 51 ? 'Elevated' :
+                riskScore >= 26 ? 'Moderate' : 'Low'
       const requestedAmount = application.amountRaw?.numericValue ?? 0
       const revenue = application.revenueRaw?.numericValue ?? 0
       const term = application.termRaw?.numericValue ?? 0
-      const fullName = item.borrower.trim()
+      const displayName = fullName.trim()
       const initials = fullName
         .split(/\s+/)
         .slice(0, 2)
@@ -286,8 +326,8 @@ function DealPilotApp({
       const status = item.status.replaceAll('_', ' ')
       return {
         id: item.id,
-        name: fullName,
-        legalName: fullName,
+        name: displayName,
+        legalName: application.legalName?.value ?? displayName,
         industry: getApplicationValue(application, 'industry') || 'Not extracted',
         amount: requestedAmount,
         product: getApplicationValue(application, 'product') || 'Not extracted',
@@ -296,6 +336,7 @@ function DealPilotApp({
         stage: item.stage as Stage,
         risk,
         riskScore,
+        knownRuleFlags: flaggedChecks.map((check) => check.code),
         status: status.charAt(0).toUpperCase() + status.slice(1),
         relationshipManager: item.relationshipManager || 'Unassigned',
         creditOfficer: item.creditOfficer || 'Unassigned',
@@ -392,18 +433,14 @@ function DealPilotApp({
       const loanIds = signal.borrowers
         .map((borrower) => findLoanForBorrower(borrower, loans)?.id)
         .filter((id): id is string => Boolean(id))
-      const score = Math.max(
-        0,
-        ...signal.borrowers.map(
-          (borrower) =>
-            fraudAnalysis.scores.find(
-              (item) =>
-                normalizeBorrowerName(item.borrower) ===
-                normalizeBorrowerName(borrower),
-            )?.score ?? 0,
-        ),
-      )
-      return { ...signal, loanIds, reviewIndex: score }
+      const borrowerScores = signal.borrowers.flatMap((borrower) => {
+        const score = fraudAnalysis.scores.find(
+          (item) => normalizeBorrowerName(item.borrower) === normalizeBorrowerName(borrower),
+        )?.score
+        return score === undefined ? [] : [score]
+      })
+      const reviewIndex = borrowerScores.length ? Math.max(...borrowerScores) : null
+      return { ...signal, loanIds, reviewIndex }
     })
   }, [fraudAnalysis, loans])
 
@@ -1386,7 +1423,7 @@ function Applications({
           <span>Risk</span>
           <select value={riskFilter} onChange={(event) => setRiskFilter(event.target.value)}>
             <option>All risk levels</option>
-            {(['Low', 'Moderate', 'Elevated', 'High'] as RiskLevel[]).map((risk) => (
+            {(['Low', 'Moderate', 'Elevated', 'High', 'No scored lead', 'Not assessed'] as RiskLevel[]).map((risk) => (
               <option key={risk}>{risk}</option>
             ))}
           </select>
@@ -1439,7 +1476,16 @@ function Applications({
                   <td>
                     <div className="risk-cell">
                       <span className={`risk-pill risk-${riskTone[loan.risk]}`}>{loan.risk}</span>
-                      <span className="risk-score">{loan.riskScore}/100</span>
+                      <span className="risk-score">
+                        {loan.riskScore === null || loan.risk === 'Not assessed'
+                          ? 'Index not assessed'
+                          : `${loan.riskScore}/100 observed review index`}
+                      </span>
+                      {loan.knownRuleFlags?.length ? (
+                        <span className="known-rule-indicator">
+                          Known rule: {loan.knownRuleFlags.join(', ')}
+                        </span>
+                      ) : null}
                     </div>
                   </td>
                   <td>
@@ -1523,32 +1569,353 @@ function FraudCenter({
   const historicalMatchIds = [
     ...new Set(signals.flatMap((signal) => signal.historicalDeals.map((deal) => deal.id))),
   ]
+  const knownRuleReviews = loans.flatMap((loan) =>
+    (loan.workflow?.checks ?? [])
+      .filter((check) => check.status === 'flagged')
+      .map((check) => ({ loan, check })),
+  )
+  const mlAnomalyCount = analysis?.mlModel?.outlierApplications ?? 0
+  const investigations = analysis?.investigations ?? []
+  const assessmentRows = loans.map((loan) => {
+    const score = analysis
+      ? findAnalysisScore(
+          analysis.scores,
+          [loan.name, loan.legalName],
+          loan.workflow?.folder,
+        )
+      : undefined
+    const borrowerAliases = new Set([
+      normalizeBorrowerName(loan.name),
+      normalizeBorrowerName(loan.legalName),
+      normalizeBorrowerName(score?.borrower ?? ''),
+    ])
+    const relatedSignals = signals.filter((signal) =>
+      signal.borrowers.some((borrower) =>
+        borrowerAliases.has(normalizeBorrowerName(borrower)),
+      ),
+    )
+    const knownRules = loan.workflow?.checks
+    const missingDocuments = loan.workflow?.requiredDocuments.filter(
+      (document) => document.status !== 'received',
+    ) ?? []
+    return {
+      loan,
+      score,
+      knownRules,
+      missingDocuments,
+      novelFindings: relatedSignals.filter(
+        (signal) => signal.classification === 'new_cross_deal_lead'
+          && signal.riskDimension !== 'behavioral_anomaly',
+      ),
+      relationshipObservations: relatedSignals.filter(
+        (signal) => signal.classification === 'shared_relationship_observation',
+      ),
+      behavioralFindings: relatedSignals.filter(
+        (signal) => signal.riskDimension === 'behavioral_anomaly',
+      ),
+      documentFindings: relatedSignals.filter(
+        (signal) => signal.classification === 'document_review_issue',
+      ),
+    }
+  })
+  const matchedAssessmentCount = assessmentRows.filter((row) => row.score).length
+  const completeInputCount = assessmentRows.filter((row) =>
+    row.score
+    && row.knownRules?.length === 5
+    && !row.knownRules.some((check) => check.status === 'not_evaluable')
+    && !row.missingDocuments.length,
+  ).length
+  const selectedSignalScores = (analysis?.scores ?? []).filter((score) =>
+    selectedSignal?.borrowers.some(
+      (borrower) =>
+        normalizeBorrowerName(score.borrower) ===
+        normalizeBorrowerName(borrower),
+    ),
+  )
+  const analysisStatus = analysis
+    ? analysis.mlModel
+      ? 'ISOLATION FOREST · TRAINED'
+      : 'CROSS-DEAL ANALYSIS · CONNECTED'
+    : analysisLoading
+      ? 'ANALYSIS LOADING'
+      : 'ANALYSIS SERVICE OFFLINE'
 
   return (
     <>
       <PageHeading
         eyebrow="REVIEW & FOLLOW-UP"
-        title="Fraud checks"
-        subtitle="Automated checks and patterns across applications offer leads, not proof. Review the evidence before taking action."
+        title="All loan risk assessments"
+        subtitle="Review every application, including cases with no detected lead or incomplete source data."
       >
         <button className="button button-secondary" onClick={onRefresh} disabled={analysisRefreshing}>
           <Activity size={15} /> {analysisRefreshing ? 'Recalculating…' : 'Recalculate'}
         </button>
         <span className={`model-status ${analysisError ? 'model-status-offline' : ''}`}>
-          <span /> {analysis ? 'CROSS-DEAL ANALYSIS · CONNECTED' : analysisLoading ? 'ANALYSIS LOADING' : 'ANALYSIS SERVICE OFFLINE'}
+          <span /> {analysisStatus}
         </span>
       </PageHeading>
+      {analysis?.mlModel ? (
+        <div className="ml-model-summary">
+          <strong>Unsupervised ML model</strong>
+          <span>
+            Isolation Forest trained on {analysis.mlModel.trainingRows} historical deals without
+            existing bank-rule labels; {analysis.mlModel.excludedKnownRuleRows} labeled deals were
+            excluded. {mlAnomalyCount} current application(s) exceeded the
+            {' '}{analysis.mlModel.thresholdPercentile}th-percentile review threshold.
+          </span>
+          <small>{analysis.mlModel.limitations}</small>
+        </div>
+      ) : null}
       <div className="demo-banner fraud-banner">
         <AlertCircle size={15} />
         <span><strong>Human review required.</strong> Cross-deal patterns are leads—not findings. Do not block or decline a borrower based on this index.</span>
       </div>
 
       <section className="fraud-metrics">
-        <div className="fraud-metric"><span>Open signals</span><strong>{signals.length}</strong><small>{new Set(signals.flatMap((signal) => signal.borrowers)).size} connected applications</small></div>
+        <div className="fraud-metric"><span>Open findings</span><strong>{signals.length}</strong><small>{new Set(signals.flatMap((signal) => signal.borrowers)).size} connected applications</small></div>
         <div className="fraud-metric"><span>Historical matches</span><strong>{historicalMatchIds.length}</strong><small>Prior deals linked by evidence</small></div>
-        <div className="fraud-metric"><span>Established controls</span><strong>5</strong><small>From historical review rules</small></div>
+        <div className="fraud-metric"><span>Known-rule reviews</span><strong>{new Set(loans.filter((loan) => loan.knownRuleFlags?.length).map((loan) => loan.id)).size}</strong><small>Separate from novel score</small></div>
         <div className="fraud-metric"><span>Current packets</span><strong>{analysis?.summary.currentPackets ?? '—'}</strong><small>Scanned by analysis service</small></div>
+        <div className="fraud-metric"><span>ML outliers</span><strong>{mlAnomalyCount}</strong><small>Historical-profile leads</small></div>
       </section>
+
+      <section className="panel risk-assessment-panel" aria-label="All loan risk assessments">
+        <div className="risk-assessment-heading">
+          <div>
+            <h2>Company-by-company assessment</h2>
+            <p>
+              Every current application is listed. Fraud review is separate from known
+              controls, document completeness, credit decisions, and workflow status.
+            </p>
+          </div>
+          <span>
+            {analysis
+              ? `${matchedAssessmentCount}/${loans.length} matched · ${completeInputCount} complete inputs`
+              : 'Analysis unavailable'}
+          </span>
+        </div>
+        <div className="risk-assessment-table-wrap">
+          <table className="risk-assessment-table">
+            <thead>
+              <tr>
+                <th>COMPANY</th>
+                <th>REVIEW PRIORITY INDEX</th>
+                <th>KNOWN BANK RULES</th>
+                <th>CROSS-DEAL / BEHAVIOR</th>
+                <th>DOCUMENT REVIEW</th>
+                <th>CREDIT REVIEW</th>
+                <th>OPERATIONS</th>
+              </tr>
+            </thead>
+            <tbody>
+              {assessmentRows.map((row) => {
+                const { loan, score, knownRules } = row
+                const flaggedRules = knownRules?.filter((check) => check.status === 'flagged').length ?? 0
+                const unassessedRules = knownRules?.filter(
+                  (check) => check.status === 'not_evaluable',
+                ).length ?? 0
+                const clearRules = knownRules?.filter(
+                  (check) => check.status === 'clear',
+                ).length ?? 0
+                const reviewedRules = knownRules?.filter(
+                  (check) => check.status === 'reviewed',
+                ).length ?? 0
+                const incompleteInputs = !knownRules
+                  || knownRules.length !== 5
+                  || knownRules.some((check) => check.status === 'not_evaluable')
+                  || row.missingDocuments.length > 0
+                const scoreBand: RiskLevel = score
+                  ? score.score === 0 && incompleteInputs ? 'Not assessed'
+                    : score.score === 0 ? 'No scored lead'
+                    : score.score >= 76 ? 'High'
+                      : score.score >= 51 ? 'Elevated'
+                        : score.score >= 26 ? 'Moderate' : 'Low'
+                  : 'Not assessed'
+                return (
+                  <tr key={loan.id}>
+                    <td>
+                      <button
+                        className="assessment-company-button"
+                        onClick={() => onOpenLoan(loan.id)}
+                      >
+                        <strong>{loan.name}</strong>
+                        <small>{loan.id}</small>
+                      </button>
+                    </td>
+                    <td>
+                      {score ? (
+                        <div className="assessment-priority">
+                          <strong>
+                            {score.score === 0 && incompleteInputs
+                              ? 'Not assessed'
+                              : `${score.score}/100`}
+                          </strong>
+                          <span className={`risk-pill risk-${riskTone[scoreBand]}`}>
+                            {incompleteInputs ? 'Incomplete inputs' : scoreBand}
+                          </span>
+                          <small>
+                            {incompleteInputs
+                              ? 'Missing documents or bank checks could not be evaluated'
+                              : score.score === 0
+                                ? 'No eligible novel-evidence family scored'
+                                : `${score.scoreBreakdown?.length ?? 0} scored evidence families`}
+                          </small>
+                        </div>
+                      ) : (
+                        <span className="assessment-not-evaluated">
+                          Not assessed
+                          <small>No matched analysis result</small>
+                        </span>
+                      )}
+                    </td>
+                    <td>
+                      {knownRules ? (
+                        <details className="assessment-details">
+                          <summary>
+                            {flaggedRules} triggered · {clearRules} clear
+                            {unassessedRules ? ` · ${unassessedRules} not evaluable` : ''}
+                            {reviewedRules ? ` · ${reviewedRules} reviewed` : ''}
+                          </summary>
+                          <ul>
+                            {knownRules.map((check) => (
+                              <li key={check.code}>
+                                <strong>{check.code} · {check.status.replaceAll('_', ' ')}</strong>
+                                <small>{check.evidence}</small>
+                              </li>
+                            ))}
+                          </ul>
+                        </details>
+                      ) : (
+                        <span className="assessment-not-evaluated">Not assessed</span>
+                      )}
+                    </td>
+                    <td>
+                      <AssessmentFindings
+                        findings={[
+                          ...row.novelFindings,
+                          ...row.relationshipObservations,
+                          ...row.behavioralFindings,
+                        ]}
+                        assessed={Boolean(score) && !incompleteInputs}
+                        emptyLabel={incompleteInputs
+                          ? 'No scored lead observed; inputs are incomplete'
+                          : 'No lead detected in processed data'}
+                      />
+                    </td>
+                    <td>
+                      {loan.workflow ? (
+                        <AssessmentDocuments
+                          missing={row.missingDocuments.map((document) => document.label)}
+                          findings={row.documentFindings}
+                        />
+                      ) : row.documentFindings.length ? (
+                        <AssessmentFindings
+                          findings={row.documentFindings}
+                          assessed
+                          emptyLabel="No document findings returned"
+                        />
+                      ) : (
+                        <span className="assessment-not-evaluated">Not assessed</span>
+                      )}
+                    </td>
+                    <td>
+                      <span className="assessment-not-evaluated">
+                        Not assessed by fraud analysis
+                        <small>No credit-capacity score or lending decision is generated here</small>
+                      </span>
+                    </td>
+                    <td>
+                      {loan.workflow ? (
+                        <div className="assessment-operations">
+                          <strong>{loan.workflow.stage} · {loan.workflow.status.replaceAll('_', ' ')}</strong>
+                          {loan.workflow.blockers.length ? (
+                            <small>{loan.workflow.blockers.join('; ')}</small>
+                          ) : (
+                            <small>No current workflow blockers reported</small>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="assessment-not-evaluated">Not assessed</span>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
+              {!assessmentRows.length && (
+                <tr><td colSpan={7}>No loan applications are available to assess.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <p className="risk-assessment-footnote">
+          A 0/100 index means no eligible novel-evidence family scored; it does not mean
+          zero fraud risk. “Not assessed” means required results are unavailable or could
+          not be matched. Rule checks that cannot run are shown as not evaluable.
+          Behavioral anomalies and shared-relationship observations are not fraud findings.
+        </p>
+      </section>
+
+      {knownRuleReviews.length ? (
+        <section className="known-rule-reviews" aria-label="Known bank-rule checks">
+          <div className="known-rule-heading">
+            <div>
+              <h2>Known bank-rule checks</h2>
+              <p>Existing control triggers are listed separately from novel cross-deal leads and scores.</p>
+            </div>
+            <span>{knownRuleReviews.length} flagged checks</span>
+          </div>
+          <div className="known-rule-list">
+            {knownRuleReviews.map(({ loan, check }) => (
+              <button
+                className="known-rule-row"
+                key={`${loan.id}-${check.code}`}
+                onClick={() => onOpenLoan(loan.id)}
+              >
+                <span className="known-rule-code">{check.code}</span>
+                <span className="known-rule-copy">
+                  <strong>{loan.name}</strong>
+                  <small>{check.evidence}</small>
+                </span>
+                <span className="known-rule-action">Review application <ChevronRight size={14} /></span>
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {investigations.length ? (
+        <section className="investigation-groups" aria-label="Connected investigations">
+          <div className="investigation-groups-heading">
+            <div><h2>Connected investigations</h2><p>Related findings are grouped by shared businesses; a score is not a fraud probability.</p></div>
+            <span>{investigations.length} groups</span>
+          </div>
+          <div className="investigation-group-list">
+            {investigations.map((investigation) => (
+              <button
+                key={investigation.id}
+                className="investigation-group"
+                onClick={() => {
+                  const firstSignal = signals.find((signal) =>
+                    investigation.signalIds.includes(signal.id),
+                  )
+                  if (firstSignal) setSelectedSignalId(firstSignal.id)
+                }}
+              >
+                <span className={`signal-severity ${investigation.severity.toLowerCase()}`}><ShieldAlert size={16} /></span>
+                <span className="investigation-group-copy">
+                  <strong>{investigation.title}</strong>
+                  <small>{investigation.borrowers.join(' · ') || 'No linked applications'}</small>
+                  <small>{investigation.patterns.slice(0, 3).join(' · ')}</small>
+                </span>
+                <span className="investigation-group-score">
+                  {investigation.priorityScore}<small>novel index</small>
+                </span>
+                <ChevronRight size={16} />
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       <div className="fraud-layout">
         <section className="panel signal-list-panel">
@@ -1565,13 +1932,32 @@ function FraudCenter({
                   className={`signal-row ${selectedSignal?.id === signal.id ? 'signal-row-active' : ''}`}
                   onClick={() => setSelectedSignalId(signal.id)}
                 >
-                  <span className={`signal-severity ${signal.severity.toLowerCase()}`}><ShieldAlert size={16} /></span>
+                  <span className={`signal-severity ${
+                    (signal.riskDimension === 'behavioral_anomaly'
+                      ? signal.behaviorSeverity ?? 'Moderate'
+                      : signal.severity).toLowerCase()
+                  }`}><ShieldAlert size={16} /></span>
                   <span className="signal-summary">
                     <strong>{signal.title}</strong>
                     <span>{target?.name ?? signal.borrowers[0] ?? 'Unmatched application'}</span>
-                    <span className="signal-tags"><i>{signal.classification === 'new_cross_deal_lead' ? 'New cross-deal' : 'Observed relationship'}</i><i>{signal.borrowers.length} linked</i></span>
+                    <span className="signal-tags"><i>
+                      {signal.riskDimension === 'behavioral_anomaly'
+                        ? `Behavioral anomaly · ${signal.behaviorSeverity ?? 'Moderate'}`
+                        : signal.classification === 'new_cross_deal_lead'
+                          ? 'Cross-deal lead'
+                          : signal.classification === 'document_review_issue'
+                            ? 'Document review'
+                            : 'Observed relationship'}
+                    </i><i>{signal.borrowers.length} linked</i></span>
                   </span>
-                  <span className="signal-confidence">{signal.reviewIndex}<small>priority index</small></span>
+                  <span className="signal-confidence">
+                    {signal.mlAnomaly
+                      ? `${signal.mlAnomaly.percentile.toFixed(1)}`
+                      : signal.reviewIndex ?? 'Not assessed'}
+                    <small>
+                      {signal.mlAnomaly ? 'ML percentile' : 'review index · not probability'}
+                    </small>
+                  </span>
                 </button>
               )
             })}
@@ -1632,16 +2018,119 @@ function FraudCenter({
           {selectedSignal ? (
             <>
               <div className="evidence-topline">
-                <span className={`risk-pill risk-${riskTone[mainLoan?.risk ?? 'Moderate']}`}>{selectedSignal.severity} review lead</span>
+                <span className={`risk-pill risk-${riskTone[
+                  selectedSignal.riskDimension === 'behavioral_anomaly'
+                    ? selectedSignal.behaviorSeverity ?? 'Moderate'
+                    : selectedSignal.severity
+                ]}`}>
+                  {selectedSignal.riskDimension === 'behavioral_anomaly'
+                    ? `Behavioral anomaly · ${selectedSignal.behaviorSeverity ?? 'Moderate'}`
+                    : `${selectedSignal.severity} review lead`}
+                </span>
                 <span className="signal-id">{selectedSignal.id} <i /> {selectedSignal.family.replaceAll('_', ' ')}</span>
               </div>
               <h2>{selectedSignal.title}</h2>
               <p className="evidence-description">{selectedSignal.description}</p>
               <div className="confidence-block">
-                <div><span>Review priority index</span><strong>{selectedSignal.reviewIndex}/100</strong></div>
-                <div className="confidence-track"><i style={{ width: `${selectedSignal.reviewIndex}%` }} /></div>
-                <span className="confidence-note">{analysis?.scoreMethod ?? 'Index is not a probability, fraud finding, or credit decision.'}</span>
+                <div>
+                  <span>Overall investigation priority · uncalibrated index</span>
+                  <strong>{selectedSignal.reviewIndex}/100</strong>
+                </div>
+                <div className="confidence-track">
+                  <i style={{
+                    width: `${selectedSignal.reviewIndex}%`,
+                  }} />
+                </div>
+                <span className="confidence-note">
+                  {selectedSignal.classification === 'document_review_issue'
+                    ? 'Document issue only. It does not contribute to fraud scoring.'
+                    : analysis?.scoreMethod ?? 'Index is not a probability, fraud finding, or credit decision.'}
+                </span>
+                {selectedSignal.mlAnomaly ? (
+                  <div className="behavioral-anomaly-summary">
+                    <strong>
+                      ML behavioral anomaly · {selectedSignal.behaviorSeverity ?? 'Moderate'}
+                    </strong>
+                    <span>
+                      Isolation Forest rank {selectedSignal.mlAnomaly.percentile.toFixed(1)}th
+                      percentile; this is separate from the investigation-priority index and
+                      is not a fraud probability.
+                    </span>
+                  </div>
+                ) : null}
+                {selectedSignal.riskDimension === 'behavioral_anomaly'
+                  && selectedSignal.depositBehavior ? (
+                    <div className="behavioral-anomaly-summary">
+                      <strong>
+                        Deposit behavior · {selectedSignal.behaviorSeverity ?? 'Moderate'}
+                      </strong>
+                      <span>
+                        Mean monthly whole-dollar rate {(
+                          selectedSignal.depositBehavior.dealLevelMean * 100
+                        ).toFixed(1)}%; historical {selectedSignal.depositBehavior.comparisonScope === 'industry'
+                          ? `NAICS ${selectedSignal.depositBehavior.industryCode} peers`
+                          : 'all-industry fallback'} median {(
+                            selectedSignal.depositBehavior.historicalMedian * 100
+                          ).toFixed(1)}%, 95th percentile {(
+                            selectedSignal.depositBehavior.historical95thPercentile * 100
+                              ).toFixed(1)}% across {selectedSignal.depositBehavior.comparisonDealCount} historical deals.
+                        Historical transaction descriptions are unavailable for channel-matched comparison.
+                      </span>
+                    </div>
+                  ) : null}
               </div>
+              <details className="score-breakdown">
+                <summary>Why this review-priority index?</summary>
+                {selectedSignalScores.length ? selectedSignalScores.map((score) => (
+                  <div className="score-breakdown-borrower" key={score.borrower}>
+                    <h3>{score.borrower} · {score.score}/100</h3>
+                    {(score.scoreBreakdown ?? []).length ? (
+                      <ol>
+                        {score.scoreBreakdown?.map((contribution) => (
+                          <li key={contribution.family}>
+                              <strong>
+                                {contribution.label} · +{contribution.points}/25 · {contribution.urgency}
+                              </strong>
+                              <span className="score-contribution-rationale">
+                                {contribution.rationale}
+                              </span>
+                              {contribution.signals.map((support) => (
+                              <div className="score-breakdown-signal" key={support.id}>
+                                <span>{support.title}</span>
+                                {support.evidence.map((item, index) => (
+                                  <small key={`${support.id}-${index}`}>
+                                    {item.text} <code>{item.source}</code>
+                                  </small>
+                                ))}
+                              </div>
+                            ))}
+                          </li>
+                        ))}
+                      </ol>
+                    ) : (
+                      <p>No scoring evidence families contributed to this application's index.</p>
+                    )}
+                    {(score.additionalFamilies ?? []).length ? (
+                      <p>
+                        Additional evidence not scored after the four-family cap:{' '}
+                        {(score.additionalFamilies ?? []).join(', ')}.
+                      </p>
+                    ) : null}
+                  </div>
+                )) : (
+                  <p>Per-family scoring details are unavailable from this analysis response.</p>
+                )}
+                <small>
+                  Each family is scored 1–25: signal severity starts at Moderate 3,
+                  Elevated 8, or High 13 points;
+                  each additional source document adds 2 (up to 8), each additional
+                  corroborating evidence type adds 2 (up to 4), and 2 or 3+ connected
+                  applicants add 1 or 3. Urgency bands: 1–5 low, 6–10 moderate,
+                  11–15 elevated, 16–20 high, 21–25 urgent. The total is capped at 100;
+                  behavioral anomalies and document issues add no points. This is not a
+                  fraud probability.
+                </small>
+              </details>
               <div className="evidence-heading"><h3>Supporting evidence</h3><span>DATA SOURCES ATTACHED</span></div>
               <ul className="evidence-list">
                 {selectedSignal.evidence.map((item, index) => (
@@ -1712,6 +2201,84 @@ function FraudCenter({
         </section>
       </div>
     </>
+  )
+}
+
+function AssessmentFindings({
+  findings,
+  assessed,
+  emptyLabel,
+}: {
+  findings: Signal[]
+  assessed: boolean
+  emptyLabel: string
+}) {
+  if (!findings.length) {
+    return (
+      <span className="assessment-not-evaluated">
+        {assessed ? emptyLabel : 'Not assessed'}
+      </span>
+    )
+  }
+  return (
+    <details className="assessment-details">
+      <summary>{findings.length} item{findings.length === 1 ? '' : 's'} for review</summary>
+      <ul>
+        {findings.map((finding) => (
+          <li key={finding.id}>
+            <strong>
+              {finding.riskDimension === 'behavioral_anomaly'
+                ? `Behavioral anomaly · ${finding.behaviorSeverity ?? 'Review'}`
+                : finding.classification === 'shared_relationship_observation'
+                  ? 'Relationship observation'
+                  : 'Cross-deal lead'}: {finding.title}
+            </strong>
+            <small>{finding.description}</small>
+            {finding.evidence.slice(0, 2).map((evidence, index) => (
+              <small key={`${finding.id}-evidence-${index}`}>
+                {evidence.text} · {evidence.source}
+              </small>
+            ))}
+          </li>
+        ))}
+      </ul>
+    </details>
+  )
+}
+
+function AssessmentDocuments({
+  missing,
+  findings,
+}: {
+  missing: string[]
+  findings: Signal[]
+}) {
+  if (!missing.length && !findings.length) {
+    return <span className="assessment-not-evaluated">No current issue surfaced</span>
+  }
+  return (
+    <details className="assessment-details">
+      <summary>
+        {missing.length ? `${missing.length} missing` : 'Complete'}
+        {findings.length ? ` · ${findings.length} inconsistency` : ''}
+      </summary>
+      <ul>
+        {missing.map((document) => (
+          <li key={document}><strong>Missing: {document}</strong></li>
+        ))}
+        {findings.map((finding) => (
+          <li key={finding.id}>
+            <strong>{finding.title}</strong>
+            <small>{finding.description}</small>
+            {finding.evidence.slice(0, 2).map((evidence, index) => (
+              <small key={`${finding.id}-evidence-${index}`}>
+                {evidence.text} · {evidence.source}
+              </small>
+            ))}
+          </li>
+        ))}
+      </ul>
+    </details>
   )
 }
 
@@ -2259,7 +2826,16 @@ function LoanDrawer({
           <div className={`business-avatar large ${loan.accent}`}>{loan.initials}</div>
           <div><h2>{loan.name}</h2><span>{loan.legalName}</span></div>
         </div>
-        <div className="drawer-status-row"><StageBadge stage={loan.stage} /><span className={`risk-pill risk-${riskTone[loan.risk]}`}>{loan.risk} risk · {loan.riskScore}/100</span></div>
+        <div className="drawer-status-row">
+          <StageBadge stage={loan.stage} />
+          <span className={`risk-pill risk-${riskTone[loan.risk]}`}>
+            {loan.risk === 'No scored lead'
+              ? 'No novel lead · 0/100'
+              : loan.risk === 'Not assessed'
+                ? 'Review index not assessed'
+                : `${loan.risk} review priority · ${loan.riskScore}/100`}
+          </span>
+        </div>
         <div className="drawer-tabs" role="tablist">
           {(['Overview', 'Documents', 'Activity'] as DetailTab[]).map((item) => (
             <button key={item} role="tab" aria-selected={tab === item} className={tab === item ? 'drawer-tab-active' : ''} onClick={() => setTab(item)}>{item}</button>

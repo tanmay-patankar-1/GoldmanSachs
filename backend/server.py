@@ -103,6 +103,7 @@ def _signature() -> tuple[tuple[str, int, int], ...]:
     shared = ROOT / "participant" / "participant" / "shared_folder"
     if shared.is_dir():
         sources.extend(shared.rglob("*.pdf"))
+        sources.extend(shared.rglob("*.csv"))
     return tuple(
         sorted(
             (path.relative_to(ROOT).as_posix(), path.stat().st_mtime_ns, path.stat().st_size)

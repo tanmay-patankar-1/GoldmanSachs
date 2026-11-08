@@ -17,6 +17,9 @@ from dealpilot.engine import (
     _similar_expense_structure,
     _supplier_concentration_signals,
     _supplier_name_variation_signals,
+    _transaction_signals,
+    _csv_transactions,
+    _document_review_signals,
     analyze,
     detect_sequential_identifiers,
     normalize_supplier,
@@ -97,13 +100,150 @@ class PatternDetectionTests(unittest.TestCase):
             type("Packet", (), {"name": "Borrower A"})(),
         ]
         signals = [
-            {"family": "payment_relationship", "borrowers": ["Borrower A"]},
-            {"family": "payment_relationship", "borrowers": ["Borrower A"]},
-            {"family": "document_identifier", "borrowers": ["Borrower A"]},
+            {
+                "id": f"signal-{index}",
+                "family": family,
+                "borrowers": ["Borrower A"],
+                "title": f"Signal {index}",
+                "evidence": [],
+            }
+            for index, family in enumerate(
+                ("payment_relationship", "payment_relationship", "document_identifier")
+            )
         ]
         score = _risk_scores(signals, packets)["borrower a"]
         self.assertEqual(score["families"], ["document_identifier", "payment_relationship"])
-        self.assertEqual(score["score"], 50)
+        self.assertEqual(score["score"], 6)
+        self.assertEqual(
+            sum(item["points"] for item in score["scoreBreakdown"]),
+            score["score"],
+        )
+        self.assertEqual(
+            [item["points"] for item in score["scoreBreakdown"]],
+            [3, 3],
+        )
+
+    def test_family_priority_increases_with_corroborating_evidence(self) -> None:
+        packets = [
+            type("Packet", (), {"name": name})()
+            for name in ("Borrower A", "Borrower B", "Borrower C")
+        ]
+        weak = {
+            "id": "weak",
+            "family": "payment_relationship",
+            "borrowers": ["Borrower A"],
+            "severity": "Moderate",
+            "title": "Limited evidence",
+            "evidence": [{
+                "kind": "payment_record",
+                "source": "quote.pdf:page 1",
+                "text": "One observation",
+            }],
+        }
+        strong = {
+            "id": "strong",
+            "family": "payment_relationship",
+            "borrowers": ["Borrower A", "Borrower B", "Borrower C"],
+            "severity": "High",
+            "title": "Corroborated evidence",
+            "evidence": [
+                {
+                    "kind": "payment_record",
+                    "source": f"quote-{index}.pdf:page 1",
+                    "text": "Supporting observation",
+                }
+                for index in range(4)
+            ] + [{
+                "kind": "historical_account",
+                "source": "deals.csv:line 4",
+                "text": "Historical corroboration",
+            }],
+        }
+        weak_score = _risk_scores([weak], packets)["borrower a"]["scoreBreakdown"][0]
+        strong_score = _risk_scores([strong], packets)["borrower a"]["scoreBreakdown"][0]
+        self.assertEqual(weak_score["points"], 3)
+        self.assertEqual(weak_score["urgency"], "Low")
+        self.assertEqual(strong_score["points"], 25)
+        self.assertEqual(strong_score["urgency"], "Urgent")
+        self.assertGreater(strong_score["points"], weak_score["points"])
+        self.assertIn("5 distinct source documents +8", strong_score["rationale"])
+        self.assertIn("2 corroborating evidence types +2", strong_score["rationale"])
+        self.assertIn("3 connected applicants +3", strong_score["rationale"])
+
+    def test_sequential_document_numbers_do_not_score_without_corroboration(self) -> None:
+        packets = [type("Packet", (), {"name": "Borrower A"})()]
+        score = _risk_scores(
+            [{"family": "document_identifier", "borrowers": ["Borrower A"]}],
+            packets,
+        )["borrower a"]
+        self.assertEqual(score["score"], 0)
+        self.assertEqual(score["families"], [])
+
+    def test_transaction_detector_generalizes_to_new_references_and_accounts(self) -> None:
+        packets = []
+        for index, name in enumerate(("Business One", "Business Two", "Business Three")):
+            packet = Packet(name, name, [], name)
+            packet.transactions = [
+                {
+                    "date": f"2026-07-0{reference + 1}",
+                    "description": f"ACH CREDIT BILL-{reference + 3}A-{index}",
+                    "amount": float(4000 + reference * 125 + index * 75),
+                    "direction": "credit",
+                    "reference": f"BILL-{reference + 3}A",
+                    "destinationLast4": "9284",
+                    "wholeDollar": True,
+                    "source": f"{name}/statement.pdf:page 1",
+                }
+                for reference in range(3)
+            ]
+            packets.append(packet)
+
+        signals, behavior = _transaction_signals(
+            packets,
+            minimum_shared_references=3,
+            minimum_destination_transfers=3,
+            minimum_round_amount_transactions=3,
+            round_amount_threshold=0.9,
+        )
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]["transactionSummary"]["sharedReferenceCount"], 3)
+        self.assertEqual(signals[0]["transactionSummary"]["sharedDestinations"], ["9284"])
+        self.assertEqual(len(signals[0]["borrowers"]), 3)
+        self.assertTrue(signals[0]["scoreContribution"])
+        self.assertEqual(len(behavior), 3)
+        self.assertTrue(all(not signal["scoreContribution"] for signal in behavior))
+
+    def test_csv_statement_parser_skips_bank_export_preamble(self) -> None:
+        folder = ROOT / "participant" / "participant" / "shared_folder" / "tyler loopwise loan stuff"
+        transactions = _csv_transactions(folder, ROOT)
+        self.assertGreater(len(transactions), 0)
+        self.assertTrue(all(transaction["source"].endswith(".csv") for transaction in transactions))
+        self.assertTrue(all(transaction["date"].startswith("2026-") for transaction in transactions))
+
+    def test_document_issues_are_reported_without_affecting_fraud_score(self) -> None:
+        root = Path.cwd()
+        pages = [
+            Page(
+                root / "application.pdf",
+                1,
+                "Federal EIN\n12-3456789\nAmount requested\n$100,000.00\n"
+                "Page 1 of 1",
+            ),
+            Page(
+                root / "request.pdf",
+                1,
+                "We are requesting $80,000.00.\n"
+                "Employer Identification Number\n12-3456789\nPage 1 of 2",
+            ),
+        ]
+        packet = Packet("Example LLC", "Example LLC", pages, "example")
+        findings = _document_review_signals([packet], root)
+        self.assertEqual(
+            {finding["family"] for finding in findings},
+            {"document_reconciliation", "document_completeness"},
+        )
+        self.assertTrue(all(not finding["scoreContribution"] for finding in findings))
+        self.assertTrue(any("100,000.00" in item["text"] for item in findings[0]["evidence"]))
 
     def test_supplier_name_variation_is_only_a_candidate_observation(self) -> None:
         current = [{
@@ -233,6 +373,37 @@ class DatasetIntegrationTests(unittest.TestCase):
         signals = result["signals"]
         self.assertEqual(result["summary"]["historicalDeals"], 257)
         self.assertEqual(result["summary"]["currentPackets"], 13)
+        self.assertEqual(len(result["scores"]), 13)
+        self.assertEqual(len({score["folder"] for score in result["scores"]}), 13)
+        lone_star = next(
+            score for score in result["scores"]
+            if score["borrower"] == "Lone Star Family Dental PLLC"
+        )
+        self.assertEqual(lone_star["folder"], "LSFD_docs")
+        self.assertTrue(all(
+            score["score"] == sum(item["points"] for item in score["scoreBreakdown"])
+            and all(1 <= item["points"] <= 25 for item in score["scoreBreakdown"])
+            for score in result["scores"]
+        ))
+        self.assertEqual(result["mlModel"]["algorithm"], "Isolation Forest")
+        self.assertEqual(result["mlModel"]["trainingRows"], 245)
+        self.assertEqual(result["mlModel"]["excludedKnownRuleRows"], 12)
+        self.assertEqual(result["mlModel"]["scoredApplications"], 13)
+        self.assertIn("not a fraud probability", result["mlModel"]["limitations"])
+        self.assertTrue(all("mlAnomaly" in score for score in result["scores"]))
+        ml_findings = [
+            signal for signal in signals if signal["family"] == "ml_anomaly"
+        ]
+        self.assertEqual(
+            result["mlModel"]["outlierApplications"],
+            len(ml_findings),
+        )
+        self.assertTrue(all(
+            signal["scoreContribution"] is False
+            and signal["mlAnomaly"]["isOutlier"]
+            and signal["evidence"][0]["source"]
+            for signal in ml_findings
+        ))
 
         payment = next(signal for signal in signals if signal["family"] == "payment_relationship")
         self.assertEqual(len(payment["borrowers"]), 3)
@@ -259,13 +430,121 @@ class DatasetIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(len(duplicate["borrowers"]), 2)
         self.assertTrue(any("Revenue $470,400.00" in item["text"] for item in duplicate["evidence"]))
-        self.assertTrue(any(signal["family"] == "financial_structure_similarity" for signal in signals))
+        structure_signals = [
+            signal for signal in signals
+            if signal["family"] == "financial_structure_similarity"
+        ]
+        self.assertTrue(structure_signals)
+        self.assertTrue(all(
+            not signal["scoreContribution"]
+            and signal["classification"] == "shared_relationship_observation"
+            for signal in structure_signals
+        ))
+        expected_scores = {
+            "Ridgeway Freight Logistics LLC": 74,
+            "Pecan Grove Catering Co LLC": 74,
+            "Summit Peak Flooring LLC": 58,
+        }
+        for borrower, expected_score in expected_scores.items():
+            borrower_score = next(
+                score for score in result["scores"]
+                if score["borrower"] == borrower
+            )
+            self.assertEqual(borrower_score["score"], expected_score)
+            self.assertEqual(
+                sum(item["points"] for item in borrower_score["scoreBreakdown"]),
+                expected_score,
+            )
+            self.assertEqual(
+                len(borrower_score["scoreBreakdown"]),
+                len(borrower_score["families"]),
+            )
+            self.assertTrue(all(
+                1 <= item["points"] <= 25
+                and item["urgency"] in {"Low", "Moderate", "Elevated", "High", "Urgent"}
+                and item["rationale"]
+                for item in borrower_score["scoreBreakdown"]
+            ))
+            self.assertEqual(
+                {item["family"] for item in borrower_score["scoreBreakdown"]},
+                set(borrower_score["families"]),
+            )
+            self.assertNotIn("deposit_behavior", borrower_score["families"])
+
+        ridgeway_deposit = next(
+            signal for signal in signals
+            if signal["family"] == "deposit_behavior"
+            and "Ridgeway Freight Logistics LLC" in signal["borrowers"]
+        )
+        self.assertEqual(ridgeway_deposit["depositBehavior"]["industryCode"], "484110")
+        self.assertEqual(ridgeway_deposit["depositBehavior"]["industryPeerCount"], 8)
+        self.assertEqual(ridgeway_deposit["depositBehavior"]["comparisonDealCount"], 8)
+        self.assertEqual(ridgeway_deposit["depositBehavior"]["comparisonScope"], "industry")
+        self.assertEqual(ridgeway_deposit["depositBehavior"]["dealLevelMean"], 1.0)
+        self.assertFalse(
+            ridgeway_deposit["depositBehavior"]["historicalChannelComparisonAvailable"]
+        )
+        monthly_evidence = [
+            item for item in ridgeway_deposit["evidence"]
+            if item["kind"] == "monthly_deposit_transactions"
+        ]
+        self.assertEqual(len(monthly_evidence), 6)
+        self.assertEqual(
+            {item["source"].split("/")[-1].split(":")[0] for item in monthly_evidence},
+            {f"Bank_Statement_2026-{month:02d}.pdf" for month in range(5, 11)},
+        )
+        self.assertTrue(all(":page 1" in item["source"] for item in monthly_evidence))
+        self.assertTrue(all("Transactions:" in item["text"] for item in monthly_evidence))
+        self.assertFalse(ridgeway_deposit["scoreContribution"])
+        self.assertEqual(ridgeway_deposit["riskDimension"], "behavioral_anomaly")
+
         preparer = next(signal for signal in signals if signal["family"] == "preparer_network")
         self.assertGreaterEqual(len(preparer["borrowers"]), 2)
         self.assertTrue(all(item["source"] for item in preparer["evidence"]))
         self.assertTrue(
             any(node["kind"] == "preparer_network" for node in result["graph"]["nodes"])
         )
+        transaction = next(
+            signal for signal in result["signals"]
+            if signal["family"] == "transaction_relationship"
+        )
+        self.assertEqual(transaction["transactionSummary"]["sharedReferenceCount"], 34)
+        self.assertEqual(transaction["transactionSummary"]["sharedDestinations"], ["8810"])
+        self.assertEqual(transaction["transactionSummary"]["matchedPostingDates"], 34)
+        self.assertTrue(any(
+            "18 transfers" in item["text"] and "$186,600.00" in item["text"]
+            for item in transaction["evidence"]
+        ))
+        for borrower in (
+            "Ridgeway Freight Logistics LLC",
+            "Pecan Grove Catering Co LLC",
+            "Summit Peak Flooring LLC",
+        ):
+            behavior = next(
+                signal for signal in result["signals"]
+                if signal["family"] == "whole_dollar_transactions"
+                and borrower in signal["borrowers"]
+            )
+            self.assertIn("123 of 123", behavior["evidence"][0]["text"])
+        document_findings = [
+            signal for signal in result["signals"]
+            if signal["classification"] == "document_review_issue"
+        ]
+        self.assertTrue(any("74-3169524" in " ".join(
+            evidence["text"] for evidence in signal["evidence"]
+        ) and "74-3196524" in " ".join(
+            evidence["text"] for evidence in signal["evidence"]
+        ) for signal in document_findings))
+        self.assertTrue(any("205,000.00" in " ".join(
+            evidence["text"] for evidence in signal["evidence"]
+        ) for signal in document_findings))
+        self.assertTrue(any("page 1 of 2" in " ".join(
+            evidence["text"] for evidence in signal["evidence"]
+        ).casefold() for signal in document_findings))
+        self.assertTrue(any(investigation["borrowers"] and
+                            len(investigation["borrowers"]) >= 3 and
+                            any("Ridgeway Freight" in name for name in investigation["borrowers"])
+                            for investigation in result["investigations"]))
         self.assertTrue(result["scoreMethod"].startswith("Uncalibrated review-priority index"))
         self.assertIn("DUP_EIN", result["baseline"]["knownFraudLabels"])
         cohorts = result["baseline"]["depositBehavior"]["repaymentCohorts"]

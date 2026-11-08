@@ -8,7 +8,13 @@ export type Stage =
   | 'Committed'
   | 'Closed'
 
-export type RiskLevel = 'Low' | 'Moderate' | 'Elevated' | 'High'
+export type RiskLevel =
+  | 'Low'
+  | 'Moderate'
+  | 'Elevated'
+  | 'High'
+  | 'No scored lead'
+  | 'Not assessed'
 
 export type Loan = {
   id: string
@@ -21,7 +27,8 @@ export type Loan = {
   term: number
   stage: Stage
   risk: RiskLevel
-  riskScore: number
+  riskScore: number | null
+  knownRuleFlags?: string[]
   status: string
   relationshipManager: string
   creditOfficer: string

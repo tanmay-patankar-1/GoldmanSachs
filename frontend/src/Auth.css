@@ -21,16 +21,14 @@
 
 .auth-brand-mark {
   display: grid;
-  width: 40px;
-  height: 40px;
+  width: 46px;
+  height: 46px;
   place-items: center;
-  border: 1px solid #8da1b3;
-  border-radius: 3px;
-  background: #edf1f4;
-  color: #355a78;
-  font-family: Georgia, serif;
-  font-size: 15px;
-  font-weight: 700;
+  border: 1px solid #b18a4d;
+  border-radius: 11px;
+  background: linear-gradient(145deg, #f0d79f, #c29a55 72%);
+  box-shadow: 0 3px 8px #9a783533, inset 0 1px #ffffff77;
+  color: #fff;
 }
 
 .auth-kicker {

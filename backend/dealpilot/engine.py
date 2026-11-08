@@ -1681,6 +1681,189 @@ def _transaction_signals(
     return signals, behavioral
 
 
+def _transaction_timing_signals(packets: list[Packet]) -> list[dict[str, Any]]:
+    grouped: dict[
+        tuple[str, str, str], list[tuple[str, str, dict[str, Any]]]
+    ] = defaultdict(list)
+    generic_terms = {
+        "ach", "bank", "branch", "business", "cash", "check", "credit", "debit",
+        "deposit", "electronic", "invoice", "online", "payment", "pmt", "pos",
+        "transfer", "wire", "from", "to", "the", "pay", "wage", "mobile", "walk",
+        "capture",
+    }
+
+    def channel_for(description: str) -> str | None:
+        value = description.casefold()
+        for channel, terms in (
+            ("wire", ("wire",)),
+            ("ach", ("ach",)),
+            ("check", ("check", "chk")),
+            ("card", ("card", "pos")),
+            ("cash", ("cash", "branch")),
+            ("transfer", ("transfer",)),
+        ):
+            if any(term in value for term in terms):
+                return channel
+        return None
+
+    def merchant_for(description: str) -> str:
+        value = re.sub(r"\b(?:to|destination|account)\s+(?:x{2,}|\*{2,})?\d{3,}\b", " ", description, flags=re.I)
+        value = re.sub(r"\b(?:inv(?:oice)?|ref(?:erence)?|trace|chk|check)[#:\s-]*[a-z0-9-]+\b", " ", value, flags=re.I)
+        tokens = [
+            token for token in re.findall(r"[a-z0-9]+", value.casefold())
+            if token not in generic_terms and len(token) >= 3
+        ]
+        return " ".join(tokens)
+
+    for packet in packets:
+        borrower_key = normalize_supplier(packet.name)
+        for transaction in packet.transactions:
+            description = transaction.get("description", "")
+            channel = channel_for(description)
+            merchant = merchant_for(description)
+            if not channel or not merchant:
+                continue
+            try:
+                day = date.fromisoformat(transaction["date"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            direction = transaction.get("direction", "unknown")
+            grouped[(direction, channel, merchant)].append(
+                (borrower_key, packet.name, {**transaction, "parsedDate": day})
+            )
+
+    signals: list[dict[str, Any]] = []
+    for (direction, channel, merchant), entries in grouped.items():
+        borrower_amounts: dict[str, list[float]] = defaultdict(list)
+        daily: dict[tuple[str, date], list[dict[str, Any]]] = defaultdict(list)
+        borrower_names: dict[str, str] = {}
+        for borrower_key, borrower_name, transaction in entries:
+            amount = abs(float(transaction.get("amount", 0)))
+            if amount <= 0:
+                continue
+            borrower_amounts[borrower_key].append(amount)
+            daily[(borrower_key, transaction["parsedDate"])].append(transaction)
+            borrower_names[borrower_key] = borrower_name
+        if len(borrower_amounts) < 3:
+            continue
+
+        medians: dict[str, float] = {}
+        for borrower, amounts in borrower_amounts.items():
+            ordered = sorted(amounts)
+            middle = len(ordered) // 2
+            medians[borrower] = (
+                ordered[middle] if len(ordered) % 2
+                else (ordered[middle - 1] + ordered[middle]) / 2
+            )
+
+        event_days = sorted({day for _, day in daily})
+        matched_windows: list[list[tuple[str, date, dict[str, Any]]]] = []
+        index = 0
+        while index < len(event_days):
+            anchor = event_days[index]
+            end = anchor.fromordinal(anchor.toordinal() + 1)
+            window = [
+                (borrower, day, transaction)
+                for (borrower, day), transactions in daily.items()
+                if anchor <= day <= end
+                for transaction in transactions[:1]
+            ]
+            if len({borrower for borrower, _, _ in window}) >= 3:
+                matched_windows.append(window)
+                index = next(
+                    (position for position, day in enumerate(event_days) if day > end),
+                    len(event_days),
+                )
+            else:
+                index += 1
+        if len(matched_windows) < 3:
+            continue
+
+        borrowers = sorted({
+            borrower
+            for window in matched_windows
+            for borrower, _, _ in window
+        })
+        if len(borrowers) < 3:
+            continue
+        if len(borrowers) >= max(5, math.ceil(len(packets) / 2)):
+            continue
+
+        normalized_matches = 0
+        for window in matched_windows:
+            ratios = [
+                abs(float(transaction.get("amount", 0))) / medians[borrower]
+                for borrower, _, transaction in window
+                if medians.get(borrower, 0) > 0
+            ]
+            if len(ratios) >= 3 and max(ratios) / min(ratios) <= 2.5:
+                normalized_matches += 1
+
+        evidence = []
+        seen_sources: set[tuple[str, str]] = set()
+        for window in matched_windows:
+            for borrower_key, day, transaction in window:
+                source_key = (borrower_key, transaction.get("source", ""))
+                if source_key in seen_sources:
+                    continue
+                seen_sources.add(source_key)
+                evidence.append(_evidence(
+                    f"{borrower_names[borrower_key]} has a {direction} {channel} transaction "
+                    f"on {day.isoformat()} for ${abs(float(transaction['amount'])):,.2f}.",
+                    transaction.get("source", ""),
+                    "transaction_timing_match",
+                ))
+        evidence.append(_evidence(
+            f"{len(matched_windows)} recurring transaction windows align within one day "
+            f"across {len(borrowers)} businesses; normalized transaction-size sequences "
+            f"are similar in {normalized_matches} windows. Amounts and identifiers were "
+            "not required to match exactly. Shared processing schedules may explain timing; "
+            "historical transaction-level timing baselines are unavailable.",
+            evidence[0]["source"],
+            "transaction_sequence_similarity",
+        ))
+        records = [
+            {
+                "borrower": borrower_names[borrower],
+                "borrowerKey": borrower,
+                "current": True,
+                "dealId": None,
+            }
+            for borrower in borrowers
+        ]
+        signal = _make_signal(
+            f"transaction-timing-{len(signals) + 1}",
+            "transaction_timing_correlation",
+            "Repeated shared-counterparty transaction timing",
+            "Several businesses show repeated, near-date-aligned transactions to a similar "
+            "normalized counterparty. Shared vendors and batch processing can be legitimate; "
+            "this is an informational relationship observation, not evidence of fraud.",
+            "Moderate",
+            records,
+            evidence,
+            [
+                "Compare original statement entries and invoices across the aligned dates.",
+                "Check whether a common processor, payroll schedule, or supplier explains the timing.",
+            ],
+        )
+        signal["scoreFamily"] = "transaction_relationship"
+        signal["scoreContribution"] = False
+        signal["classification"] = "shared_relationship_observation"
+        signal["riskDimension"] = "transaction_pattern"
+        signal["transactionSummary"] = {
+            "sharedReferenceCount": 0,
+            "sharedReferences": [],
+            "sharedDestinations": [],
+            "matchedPostingDates": len(matched_windows),
+            "normalizedSequenceMatches": normalized_matches,
+            "channel": channel,
+            "direction": direction,
+            "counterpartyPattern": merchant,
+        }
+        signals.append(signal)
+    return signals
+
+
 def _document_review_signals(
     packets: list[Packet], root: Path
 ) -> list[dict[str, Any]]:
@@ -2228,20 +2411,22 @@ SCORE_FAMILY_ORDER = (
     "document_identifier",
     "deposit_behavior",
 )
+INVESTIGATION_SCORE_WEIGHTS = {
+    "evidenceStrength": 35,
+    "independentCorroboration": 25,
+    "crossDealCoordination": 20,
+    "historicalDeviation": 10,
+    "evidenceReliability": 10,
+}
 
 
-def _family_score_details(
-    family_signals: list[dict[str, Any]],
-) -> dict[str, Any]:
-    severity_points = {"Moderate": 3, "Elevated": 8, "High": 13}
-    severity = max(
-        (signal.get("severity", "Moderate") for signal in family_signals),
-        key=lambda value: severity_points.get(value, 3),
-    )
-    base_points = severity_points.get(severity, 3)
+def _evidence_dimensions(
+    signals: list[dict[str, Any]],
+) -> dict[str, int]:
+    severity_points = {"Moderate": 45, "Elevated": 65, "High": 85}
     evidence = [
         item
-        for signal in family_signals
+        for signal in signals
         for item in signal.get("evidence", [])
     ]
     source_documents = {
@@ -2253,19 +2438,65 @@ def _family_score_details(
         item.get("kind", "")
         for item in evidence
         if item.get("kind")
-        and "caveat" not in item.get("kind", "").casefold()
-        and "template_control" not in item.get("kind", "").casefold()
+        and not any(
+            marker in item.get("kind", "").casefold()
+            for marker in ("caveat", "template_control", "normalization")
+        )
     }
+    independent_sources = min(100, max(0, len(source_documents) - 1) * 25)
+    independent_types = min(100, max(0, len(evidence_types) - 1) * 30)
     borrowers = {
         normalize_supplier(borrower)
-        for signal in family_signals
+        for signal in signals
         for borrower in signal.get("borrowers", [])
     }
-    source_bonus = min(8, max(0, len(source_documents) - 1) * 2)
-    evidence_type_bonus = min(4, max(0, len(evidence_types) - 1) * 2)
-    borrower_bonus = 3 if len(borrowers) >= 3 else 1 if len(borrowers) == 2 else 0
-    raw_points = base_points + source_bonus + evidence_type_bonus + borrower_bonus
-    points = min(25, raw_points)
+    historical_evidence = any(
+        "historical" in item.get("kind", "").casefold()
+        or "cohort" in item.get("kind", "").casefold()
+        or "percentile" in item.get("kind", "").casefold()
+        for item in evidence
+    )
+    traceable = sum(bool(item.get("source")) for item in evidence)
+    traceability_ratio = traceable / len(evidence) if evidence else 0
+    reliability = min(
+        90,
+        round(40 + traceability_ratio * 35 + min(25, len(source_documents) * 5)),
+    )
+    coordination = (
+        min(100, (len(borrowers) - 1) * 30 + 10)
+        if len(borrowers) > 1
+        else 0
+    )
+    return {
+        "evidenceStrength": max(
+            (severity_points.get(signal.get("severity", "Moderate"), 45) for signal in signals),
+            default=0,
+        ),
+        "independentCorroboration": round(
+            independent_sources * 0.6 + independent_types * 0.4
+        ),
+        "crossDealCoordination": coordination,
+        "historicalDeviation": 75 if historical_evidence else 0,
+        "evidenceReliability": reliability if evidence else 0,
+    }
+
+
+def _weighted_priority(dimensions: dict[str, int]) -> int:
+    return round(
+        sum(
+            dimensions.get(dimension, 0) * weight
+            for dimension, weight in INVESTIGATION_SCORE_WEIGHTS.items()
+        )
+        / 100
+    )
+
+
+def _family_score_details(
+    family_signals: list[dict[str, Any]],
+) -> dict[str, Any]:
+    dimensions = _evidence_dimensions(family_signals)
+    weighted_score = _weighted_priority(dimensions)
+    points = min(25, max(1, round(weighted_score / 4)))
     urgency = (
         "Low" if points <= 5
         else "Moderate" if points <= 10
@@ -2274,16 +2505,16 @@ def _family_score_details(
         else "Urgent"
     )
     rationale_parts = [
-        f"{severity} signal severity +{base_points}",
-        f"{len(source_documents)} distinct source documents +{source_bonus}",
-        f"{len(evidence_types)} corroborating evidence types +{evidence_type_bonus}",
-        f"{len(borrowers)} connected applicants +{borrower_bonus}",
-        f"{'capped at 25' if raw_points > 25 else f'total {points}/25'}",
+        f"{dimension} {dimensions[dimension]}/100 × "
+        f"{INVESTIGATION_SCORE_WEIGHTS[dimension]}%"
+        for dimension in INVESTIGATION_SCORE_WEIGHTS
     ]
+    rationale_parts.append(f"family contribution {points}/25")
     return {
         "points": points,
         "urgency": urgency,
         "rationale": "; ".join(rationale_parts),
+        "dimensions": dimensions,
     }
 
 
@@ -2341,15 +2572,178 @@ def _risk_scores(signals: list[dict[str, Any]], packets: list[Packet]) -> dict[s
             "families": counted_families,
             "additionalFamilies": ordered_families[family_count:],
             "scoreBreakdown": breakdown,
+            "dimensions": {
+                dimension: round(
+                    sum(item["dimensions"][dimension] for item in breakdown)
+                    / len(breakdown)
+                )
+                for dimension in INVESTIGATION_SCORE_WEIGHTS
+            } if breakdown else _evidence_dimensions([]),
+            "evidenceConfidence": round(
+                sum(item["dimensions"]["evidenceReliability"] for item in breakdown)
+                / len(breakdown)
+            ) if breakdown else 0,
+            "evidenceConfidenceBasis": (
+                "Source traceability and document diversity; extraction and source truth "
+                "are not independently verified."
+            ),
+            "assessmentStatus": (
+                "review_required" if breakdown
+                else "signals_detected" if any(
+                    normalize_supplier(packet.name)
+                    in {
+                        normalize_supplier(borrower)
+                        for borrower in signal.get("borrowers", [])
+                    }
+                    for signal in signals
+                )
+                else "no_signals_detected"
+            ),
             "method": (
-                "Uncalibrated novel-evidence review index: each distinct family receives "
-                "1–25 points from signal severity and corroboration across source documents, "
-                "evidence types, and connected applicants; capped at four families. "
-                "Behavioral anomalies, document discrepancies, known bank-rule triggers, "
-                "historical labels, and operational delays do not contribute."
+                "Uncalibrated review-priority index: evidence strength, independent "
+                "corroboration, cross-deal coordination, historical deviation, and source "
+                "traceability use configurable weights; each distinct scoring family "
+                "contributes 1–25 points, capped at four families. The index is not a "
+                "fraud probability. Behavioral anomalies, document discrepancies, known "
+                "bank-rule triggers, historical labels, and operational delays do not contribute."
             ),
         }
     return scores
+
+
+def _graph_cluster_signals(signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    parent: dict[str, str] = {}
+
+    def find(key: str) -> str:
+        parent.setdefault(key, key)
+        if parent[key] != key:
+            parent[key] = find(parent[key])
+        return parent[key]
+
+    relations = [
+        signal
+        for signal in signals
+        if len(set(signal.get("borrowers", []))) > 1
+        and signal.get("riskDimension") != "behavioral_anomaly"
+        and (
+            signal.get("scoreContribution", True)
+            or signal.get("connectsInvestigation", False)
+        )
+    ]
+    for signal in relations:
+        keys = sorted({normalize_supplier(name) for name in signal["borrowers"]})
+        for key in keys[1:]:
+            parent[find(key)] = find(keys[0])
+
+    components: dict[str, set[str]] = defaultdict(set)
+    for signal in relations:
+        for borrower in signal["borrowers"]:
+            key = normalize_supplier(borrower)
+            components[find(key)].add(key)
+
+    display_names = {
+        normalize_supplier(borrower): borrower
+        for signal in relations
+        for borrower in signal["borrowers"]
+    }
+    clusters: list[dict[str, Any]] = []
+    for keys in components.values():
+        related = [
+            signal
+            for signal in relations
+            if {
+                normalize_supplier(name)
+                for name in signal["borrowers"]
+            } <= keys
+        ]
+        families = sorted({
+            signal.get("scoreFamily", signal["family"])
+            for signal in related
+            if signal.get("scoreContribution", True)
+        })
+        if len(keys) < 3 or len(families) < 2:
+            continue
+
+        source_documents = {
+            re.sub(r":(?:page|line)\s+\d+.*$", "", item.get("source", ""), flags=re.I)
+            for signal in related
+            for item in signal.get("evidence", [])
+            if item.get("source")
+        }
+        source_evidence = []
+        seen_sources: set[str] = set()
+        for signal in related:
+            for item in signal.get("evidence", []):
+                source = item.get("source", "")
+                if source and source not in seen_sources:
+                    seen_sources.add(source)
+                    source_evidence.append(_evidence(
+                        f"{signal.get('title', signal['family'])}: {item['text']}",
+                        source,
+                        "graph_relationship_support",
+                    ))
+                    if len(source_evidence) >= 8:
+                        break
+            if len(source_evidence) >= 8:
+                break
+        if not source_evidence:
+            continue
+
+        borrowers = sorted(display_names[key] for key in keys)
+        records = [
+            {
+                "borrower": borrower,
+                "borrowerKey": normalize_supplier(borrower),
+                "current": True,
+                "dealId": None,
+            }
+            for borrower in borrowers
+        ]
+        graph_signal = _make_signal(
+            f"graph-cluster-{len(clusters) + 1}",
+            "graph_relationship_cluster",
+            "Multiple relationship types connect this application cluster",
+            f"{len(borrowers)} applications are linked by {len(families)} distinct "
+            "evidence families across multiple source documents. Shared businesses, "
+            "suppliers, or service providers can be legitimate; this graph summary "
+            "organizes evidence for human review and is not a fraud conclusion.",
+            "High" if len(families) >= 3 else "Elevated",
+            records,
+            [
+                _evidence(
+                    f"Connected relationship families: {', '.join(families)}; "
+                    f"{len(source_documents)} distinct source documents; "
+                    f"{len(related)} underlying findings.",
+                    source_evidence[0]["source"],
+                    "graph_cluster_summary",
+                ),
+                *source_evidence,
+                _evidence(
+                    "Historical graph frequencies and verified ownership links are unavailable; "
+                    "cluster rarity and beneficial ownership remain unresolved.",
+                    source_evidence[0]["source"],
+                    "graph_baseline_limit",
+                ),
+            ],
+            [
+                "Verify whether shared entities have an independently documented legitimate relationship.",
+                "Review original records from each source before drawing conclusions.",
+            ],
+        )
+        graph_signal["scoreFamily"] = "graph_relationship"
+        graph_signal["scoreContribution"] = False
+        graph_signal["riskDimension"] = "graph_anomaly"
+        graph_signal["connectsInvestigation"] = True
+        graph_signal["graphSummary"] = {
+            "borrowerCount": len(borrowers),
+            "relationshipFamilies": families,
+            "relationshipFamilyCount": len(families),
+            "underlyingFindingCount": len(related),
+            "sourceDocumentCount": len(source_documents),
+            "historicalComparisonAvailable": False,
+        }
+        clusters.append(graph_signal)
+    return clusters
 
 
 def _investigations(
@@ -2363,49 +2757,104 @@ def _investigations(
             parent[key] = find(parent[key])
         return parent[key]
 
+    for score in scores.values():
+        find(normalize_supplier(score["borrower"]))
+
     for signal in signals:
         borrowers = sorted({normalize_supplier(name) for name in signal["borrowers"]})
+        if (
+            len(borrowers) < 2
+            or signal.get("riskDimension") == "behavioral_anomaly"
+            or signal.get("classification") in {
+                "document_review_issue",
+                "shared_relationship_observation",
+            } and not signal.get("connectsInvestigation", False)
+        ):
+            continue
         for key in borrowers[1:]:
             parent[find(key)] = find(borrowers[0])
 
     component_signals: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for index, signal in enumerate(signals):
         keys = sorted({normalize_supplier(name) for name in signal["borrowers"]})
-        root = find(keys[0]) if keys else f"unlinked-{index}"
-        component_signals[root].append(signal)
+        roots = {find(key) for key in keys} if keys else {f"unlinked-{index}"}
+        for root in roots:
+            component_signals[root].append(signal)
+
+    component_borrowers: dict[str, set[str]] = defaultdict(set)
+    for score in scores.values():
+        key = normalize_supplier(score["borrower"])
+        root = find(key)
+        component_signals[root]
+        component_borrowers[root].add(score["borrower"])
 
     severity_rank = {"Moderate": 1, "Elevated": 2, "High": 3}
     investigations: list[dict[str, Any]] = []
     for index, group in enumerate(
         sorted(
-            component_signals.values(),
-            key=lambda items: sorted(
-                normalize_supplier(name)
-                for signal in items
-                for name in signal["borrowers"]
-            ),
+            component_signals.items(),
+            key=lambda item: sorted(normalize_supplier(name) for name in component_borrowers[item[0]]),
         ),
         start=1,
     ):
-        borrowers = sorted(
-            {
-                name
-                for signal in group
-                for name in signal["borrowers"]
-            }
-        )
-        related_scores = [
-            scores.get(normalize_supplier(name), {}).get("score", 0)
-            for name in borrowers
-        ]
+        root, group = group
+        borrowers = sorted(component_borrowers[root])
         investigation_signals = [
             signal for signal in group
-            if signal.get("riskDimension") != "behavioral_anomaly"
+            if signal.get("riskDimension") not in {"behavioral_anomaly", "graph_anomaly"}
+            and signal.get("classification") != "document_review_issue"
         ]
+        scoring_signals = [
+            signal for signal in investigation_signals
+            if signal.get("scoreContribution", True)
+        ]
+        dimensions = _evidence_dimensions(scoring_signals)
+        related_families = {
+            signal.get("scoreFamily", signal["family"])
+            for signal in scoring_signals
+        }
+        dimensions["independentCorroboration"] = min(
+            100,
+            max(
+                dimensions["independentCorroboration"],
+                max(0, len(related_families) - 1) * 35,
+            ),
+        )
+        dimensions["crossDealCoordination"] = min(
+            100,
+            max(
+                dimensions["crossDealCoordination"],
+                max(0, len(borrowers) - 1) * 30 + 10 if len(borrowers) > 1 else 0,
+            ),
+        )
+        priority_score = _weighted_priority(dimensions) if scoring_signals else 0
         severity = max(
             (signal["severity"] for signal in investigation_signals),
             key=lambda value: severity_rank.get(value, 0),
             default="Moderate",
+        )
+        group_title = (
+            "Connected review cluster"
+            if len(borrowers) > 1 and scoring_signals
+            else f"Application review: {borrowers[0]}"
+            if borrowers and group
+            else f"Application assessment: {borrowers[0]}"
+            if borrowers
+            else "Unlinked review"
+        )
+        alternative_explanations = sorted({
+            signal["description"]
+            for signal in group
+            if signal.get("classification") == "shared_relationship_observation"
+            or any(
+                phrase in signal.get("description", "").casefold()
+                for phrase in ("can be legitimate", "may be legitimate", "could be legitimate")
+            )
+        })
+        status = (
+            "review_required" if scoring_signals
+            else "informational_only" if group
+            else "no_signals_detected"
         )
         investigation_id = f"investigation-{index:02d}"
         for signal in group:
@@ -2413,20 +2862,29 @@ def _investigations(
         investigations.append(
             {
                 "id": investigation_id,
-                "title": (
-                    "Connected review cluster"
-                    if len(borrowers) > 1
-                    else f"Application review: {borrowers[0]}"
-                    if borrowers
-                    else "Unlinked review"
-                ),
+                "title": group_title,
                 "severity": severity,
                 "borrowers": borrowers,
                 "signalIds": [signal["id"] for signal in group],
-                "patterns": [signal["title"] for signal in group],
-                "priorityScore": max(related_scores, default=0),
+                "patterns": list(dict.fromkeys(signal["title"] for signal in group)),
+                "priorityScore": priority_score,
+                "dimensions": dimensions,
+                "evidenceConfidence": dimensions["evidenceReliability"],
+                "evidenceConfidenceBasis": (
+                    "Source traceability and document diversity; extraction and source truth "
+                    "are not independently verified."
+                ),
+                "status": status,
+                "alternativeExplanations": alternative_explanations,
+                "contextAssessment": (
+                    "unresolved" if scoring_signals or alternative_explanations
+                    else "no_novel_evidence"
+                ),
                 "scoreIsProbability": False,
-                "severityBasis": "Investigation evidence; behavioral anomaly severity is reported separately.",
+                "severityBasis": (
+                    "Evidence severity; anomaly-only signals and known bank-rule results "
+                    "are reported separately."
+                ),
             }
         )
     return investigations
@@ -2692,6 +3150,29 @@ def _graph(
         summary = signal.get("transactionSummary", {})
         reference_ids = set(summary.get("sharedReferences", []))
         destinations = set(summary.get("sharedDestinations", []))
+        if signal["family"] == "transaction_timing_correlation":
+            pattern_id = f"transaction-timing:{signal['id']}"
+            nodes[pattern_id] = _node(
+                pattern_id, signal["title"], "transaction_timing_pattern"
+            )
+            for borrower in signal["borrowers"]:
+                app_id = app_id_by_key.get(normalize_supplier(borrower))
+                if app_id:
+                    evidence = next(
+                        (
+                            item["source"] for item in signal["evidence"]
+                            if borrower.casefold() in item["text"].casefold()
+                        ),
+                        signal["evidence"][0]["source"],
+                    )
+                    add_edge(
+                        app_id,
+                        pattern_id,
+                        "synchronized_transaction_timing",
+                        evidence,
+                        signal["id"],
+                    )
+            continue
         for borrower in signal["borrowers"]:
             key = normalize_supplier(borrower)
             app_id = app_id_by_key.get(key)
@@ -2770,6 +3251,8 @@ def _graph(
                 if signal["family"] == "preparer_network"
                 else "ml_anomaly"
                 if signal["family"] == "ml_anomaly"
+                else "graph_anomaly"
+                if signal["family"] == "graph_relationship_cluster"
                 else "document_review"
                 if signal["family"] in {"document_reconciliation", "document_completeness"}
                 else "financial_pattern"
@@ -2874,6 +3357,7 @@ def analyze(data_root: Path) -> dict[str, Any]:
     )
     quote_signals, _ = _quote_signals(packets)
     transaction_signals, whole_dollar_signals = _transaction_signals(packets)
+    transaction_signals.extend(_transaction_timing_signals(packets))
     document_review_signals = _document_review_signals(packets, data_root)
     financial_signals = _financial_signals(packets, data_root)
     financial_structure_signals = _financial_structure_signals(packets, data_root)
@@ -2939,6 +3423,9 @@ def analyze(data_root: Path) -> dict[str, Any]:
         + document_review_signals
         + ml_signals
     )
+    graph_signals = _graph_cluster_signals(signals)
+    signals.extend(graph_signals)
+    supplementary_signals.extend(graph_signals)
     scores = _risk_scores(signals, packets)
     for borrower_key, ml_score in ml_scores.items():
         scores[borrower_key]["mlAnomaly"] = ml_score
@@ -2991,15 +3478,14 @@ def analyze(data_root: Path) -> dict[str, Any]:
             outlier_applications=len(ml_signals),
         ),
         "scoreMethod": (
-            "Uncalibrated review-priority index: each distinct scoring family receives "
-            "1–25 points based on the strongest signal severity, distinct source documents, "
-            "corroborating evidence types, and connected applicants; capped at four families. "
-            "Supplier account reuse, name variation, concentration, and account history count "
-            "once; financial-value and expense-structure similarity count once. Behavioral "
-            "anomalies, document inconsistencies, and whole-dollar patterns are informational "
-            "and add no points. Shared-preparer relationships and other shared-relationship "
-            "observations add no points without independent evidence. "
-            "This is not a probability of fraud and is not trained on historical fraud labels."
+            "Uncalibrated review-priority index using evidence strength (35%), independent "
+            "corroboration (25%), cross-deal coordination (20%), historical deviation (10%), "
+            "and source traceability (10%). Each distinct scoring family contributes 1–25 "
+            "points, capped at four families. Correlated supplier findings and financial "
+            "similarities are grouped to avoid double counting. Behavioral anomalies, "
+            "document inconsistencies, known bank-rule triggers, and whole-dollar patterns "
+            "are separate from novel-evidence points. Evidence confidence measures traceability, "
+            "not truth or fraud probability. The score is not trained on historical fraud labels."
         ),
         "scores": list(scores.values()),
         "signals": signals,

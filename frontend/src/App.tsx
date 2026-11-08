@@ -230,7 +230,7 @@ function App() {
   }
 
   if (sessionLoading) {
-    return <main className="auth-page"><p role="status">Checking your DealPilot session...</p></main>
+    return <main className="auth-page"><p role="status">Checking your Verifin session...</p></main>
   }
   if (!employee) {
     return <Auth onAuthenticated={setEmployee} initialMessage={sessionError} />
@@ -618,11 +618,11 @@ function DealPilotApp({
       <aside className={`sidebar ${mobileNavOpen ? 'sidebar-open' : ''}`}>
         <div className="brand-lockup">
           <div className="brand-mark" aria-hidden="true">
-            <span>GS</span>
+            <ArrowUpRight size={20} strokeWidth={2.4} />
           </div>
           <div className="brand-name">
-            <strong>DealPilot</strong>
-            <span>COMMERCIAL LENDING</span>
+            <strong>Verifin</strong>
+            <span>Verify smarter. Financially safer.</span>
           </div>
           <button
             className="icon-button mobile-nav-close"
@@ -1760,6 +1760,11 @@ function FraudCenter({
                                 ? 'No eligible novel-evidence family scored'
                                 : `${score.scoreBreakdown?.length ?? 0} scored evidence families`}
                           </small>
+                          {score.evidenceConfidence !== undefined && score.evidenceConfidence > 0 && (
+                            <small>
+                              Evidence traceability {score.evidenceConfidence}%
+                            </small>
+                          )}
                         </div>
                       ) : (
                         <span className="assessment-not-evaluated">
@@ -1884,35 +1889,67 @@ function FraudCenter({
       ) : null}
 
       {investigations.length ? (
-        <section className="investigation-groups" aria-label="Connected investigations">
+        <section className="investigation-groups" aria-label="Application review assessments">
           <div className="investigation-groups-heading">
-            <div><h2>Connected investigations</h2><p>Related findings are grouped by shared businesses; a score is not a fraud probability.</p></div>
-            <span>{investigations.length} groups</span>
+            <div><h2>Application review assessments</h2><p>Corroborated findings are grouped; priority is not a fraud probability or lending decision.</p></div>
+            <span>{investigations.length} assessments</span>
           </div>
           <div className="investigation-group-list">
-            {investigations.map((investigation) => (
+            {investigations.map((investigation) => {
+              const dimensions = investigation.dimensions
+              const firstSignal = signals.find((signal) =>
+                investigation.signalIds.includes(signal.id),
+              )
+              const reviewRequired = investigation.status === 'review_required'
+              return (
               <button
                 key={investigation.id}
                 className="investigation-group"
                 onClick={() => {
-                  const firstSignal = signals.find((signal) =>
-                    investigation.signalIds.includes(signal.id),
-                  )
                   if (firstSignal) setSelectedSignalId(firstSignal.id)
+                  else {
+                    const loan = loans.find((candidate) =>
+                      investigation.borrowers.includes(candidate.name),
+                    )
+                    if (loan) onOpenLoan(loan.id)
+                  }
                 }}
               >
-                <span className={`signal-severity ${investigation.severity.toLowerCase()}`}><ShieldAlert size={16} /></span>
+                <span className={`signal-severity ${
+                  reviewRequired ? investigation.severity.toLowerCase() : 'assessment-neutral'
+                }`}>
+                  {reviewRequired ? <ShieldAlert size={16} /> : <CheckCircle2 size={16} />}
+                </span>
                 <span className="investigation-group-copy">
                   <strong>{investigation.title}</strong>
                   <small>{investigation.borrowers.join(' · ') || 'No linked applications'}</small>
                   <small>{investigation.patterns.slice(0, 3).join(' · ')}</small>
+                  {dimensions && (
+                    <small className="investigation-dimension-summary">
+                      Evidence {dimensions.evidenceStrength} · Corroboration {dimensions.independentCorroboration}
+                      {' · '}Coordination {dimensions.crossDealCoordination} · History {dimensions.historicalDeviation}
+                      {' · '}Traceability {dimensions.evidenceReliability}
+                    </small>
+                  )}
+                  {investigation.alternativeExplanations?.length ? (
+                    <small className="investigation-context-summary">
+                      Legitimate explanations remain unresolved
+                    </small>
+                  ) : (
+                    <small>
+                      {investigation.status === 'no_signals_detected'
+                        ? 'No novel signals detected; not a clearance'
+                        : 'Informational findings only'}
+                    </small>
+                  )}
                 </span>
                 <span className="investigation-group-score">
-                  {investigation.priorityScore}<small>novel index</small>
+                  {investigation.priorityScore}<small>review priority /100</small>
                 </span>
-                <ChevronRight size={16} />
+                {reviewRequired ? <ChevronRight size={16} /> : null}
               </button>
-            ))}
+              )
+            })}
           </div>
         </section>
       ) : null}
@@ -2298,6 +2335,32 @@ type GraphNode = {
   sourceKind: string
 }
 
+function graphLabelLines(label: string, maxCharacters: number, maxLines = 2) {
+  const words = label.trim().split(/\s+/).filter(Boolean)
+  const lines: string[] = []
+  let currentLine = ''
+
+  for (const word of words) {
+    const parts = word.match(new RegExp(`.{1,${maxCharacters}}`, 'g')) ?? [word]
+    for (const part of parts) {
+      if (currentLine && currentLine.length + part.length + 1 > maxCharacters) {
+        lines.push(currentLine)
+        currentLine = ''
+      }
+      currentLine = currentLine ? `${currentLine} ${part}` : part
+    }
+  }
+
+  if (currentLine) lines.push(currentLine)
+  if (lines.length > maxLines) {
+    lines.length = maxLines
+    const lastLine = maxLines - 1
+    lines[lastLine] = `${lines[lastLine].slice(0, maxCharacters - 1)}…`
+  }
+
+  return lines.length ? lines : [label]
+}
+
 function NetworkExplorer({
   loans,
   initialSelection,
@@ -2508,25 +2571,38 @@ function NetworkExplorer({
                       if (event.key === 'Enter' || event.key === ' ') setSelectedSourceId(node.sourceId)
                     }}
                   >
+                    <title>{node.label}</title>
                     {node.kind === 'loan' ? (
                       <>
                         <circle cx={node.x} cy={node.y} r="39" className="graph-node-halo" />
                         <circle cx={node.x} cy={node.y} r="29" className={`graph-node-circle ${node.sourceKind === 'historical_deal' ? 'risk-node-low' : `risk-node-${riskTone[node.risk ?? 'Low']}`}`} filter="url(#node-shadow)" />
                         <text x={node.x} y={node.y + 4} className="graph-initials">{loans.find((loan) => loan.id === node.loanId)?.initials ?? node.label.slice(0, 3).toUpperCase()}</text>
                         {(node.risk === 'High' || node.risk === 'Elevated') && <circle cx={node.x + 21} cy={node.y - 21} r="6" className="graph-warning-dot" />}
-                        <text x={node.x} y={node.y + 54} className="graph-label">{node.label}</text>
+                        <text x={node.x} y={node.y + 49} className="graph-label">
+                          {graphLabelLines(node.label, 22).map((line, index) => (
+                            <tspan key={index} x={node.x} dy={index === 0 ? 0 : 13}>{line}</tspan>
+                          ))}
+                        </text>
                       </>
                     ) : node.kind === 'document' ? (
                       <>
-                        <rect x={node.x - 71} y={node.y - 24} width="142" height="48" rx="14" className="graph-entity-box graph-document-box" />
-                        <Fingerprint x={node.x - 58} y={node.y - 9} width={18} height={18} className="graph-entity-icon" />
-                        <text x={node.x + 9} y={node.y + 4} className="graph-entity-label">{node.label.length > 20 ? `${node.label.slice(0, 19)}…` : node.label}</text>
+                        <rect x={node.x - 80} y={node.y - 24} width="160" height="48" rx="14" className="graph-entity-box graph-document-box" />
+                        <Fingerprint x={node.x - 67} y={node.y - 9} width={18} height={18} className="graph-entity-icon" />
+                        <text x={node.x + 17} y={node.y - 2} className="graph-entity-label">
+                          {graphLabelLines(node.label, 18).map((line, index) => (
+                            <tspan key={index} x={node.x + 17} dy={index === 0 ? 0 : 12}>{line}</tspan>
+                          ))}
+                        </text>
                       </>
                     ) : (
                       <>
-                        <rect x={node.x - 62} y={node.y - 21} width="124" height="42" rx="14" className={`graph-entity-box ${node.kind === 'vendor' ? 'graph-vendor-box' : ''}`} />
-                        {node.kind === 'vendor' ? <HandCoins x={node.x - 48} y={node.y - 9} width={17} height={17} className="graph-entity-icon" /> : <Users x={node.x - 47} y={node.y - 9} width={17} height={17} className="graph-entity-icon" />}
-                        <text x={node.x + 7} y={node.y + 4} className="graph-entity-label">{node.label.length > 20 ? `${node.label.slice(0, 19)}…` : node.label}</text>
+                        <rect x={node.x - 76} y={node.y - 21} width="152" height="42" rx="14" className={`graph-entity-box ${node.kind === 'vendor' ? 'graph-vendor-box' : ''}`} />
+                        {node.kind === 'vendor' ? <HandCoins x={node.x - 61} y={node.y - 9} width={17} height={17} className="graph-entity-icon" /> : <Users x={node.x - 60} y={node.y - 9} width={17} height={17} className="graph-entity-icon" />}
+                        <text x={node.x + 20} y={node.y - 2} className="graph-entity-label">
+                          {graphLabelLines(node.label, 17).map((line, index) => (
+                            <tspan key={index} x={node.x + 20} dy={index === 0 ? 0 : 11}>{line}</tspan>
+                          ))}
+                        </text>
                       </>
                     )}
                   </g>

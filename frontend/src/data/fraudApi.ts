@@ -32,7 +32,7 @@ export type CrossDealSignal = {
   evidence: FraudEvidence[]
   recommendedActions: string[]
   scoreContribution?: boolean
-  riskDimension?: 'investigation' | 'behavioral_anomaly'
+  riskDimension?: 'investigation' | 'behavioral_anomaly' | 'transaction_pattern' | 'graph_anomaly'
   behaviorSeverity?: 'Low' | 'Moderate' | 'High'
   depositBehavior?: {
     industryCode: string | null
@@ -57,7 +57,27 @@ export type CrossDealSignal = {
     sharedReferences: string[]
     sharedDestinations: string[]
     matchedPostingDates: number
+    normalizedSequenceMatches?: number
+    channel?: string
+    direction?: string
+    counterpartyPattern?: string
   }
+  graphSummary?: {
+    borrowerCount: number
+    relationshipFamilies: string[]
+    relationshipFamilyCount: number
+    underlyingFindingCount: number
+    sourceDocumentCount: number
+    historicalComparisonAvailable: boolean
+  }
+}
+
+export type FraudScoreDimensions = {
+  evidenceStrength: number
+  independentCorroboration: number
+  crossDealCoordination: number
+  historicalDeviation: number
+  evidenceReliability: number
 }
 
 export type FraudInvestigation = {
@@ -68,6 +88,12 @@ export type FraudInvestigation = {
   signalIds: string[]
   patterns: string[]
   priorityScore: number
+  dimensions?: FraudScoreDimensions
+  evidenceConfidence?: number
+  evidenceConfidenceBasis?: string
+  status?: 'review_required' | 'informational_only' | 'no_signals_detected'
+  alternativeExplanations?: string[]
+  contextAssessment?: 'unresolved' | 'no_novel_evidence'
   scoreIsProbability: false
   severityBasis?: string
 }
@@ -84,6 +110,7 @@ export type FraudScoreContribution = {
   points: number
   urgency: 'Low' | 'Moderate' | 'Elevated' | 'High' | 'Urgent'
   rationale: string
+  dimensions?: FraudScoreDimensions
   signals: Array<{
     id: string
     title: string
@@ -164,6 +191,10 @@ export type FraudAnalysis = {
     families: string[]
     additionalFamilies?: string[]
     scoreBreakdown?: FraudScoreContribution[]
+    dimensions?: FraudScoreDimensions
+    evidenceConfidence?: number
+    evidenceConfidenceBasis?: string
+    assessmentStatus?: 'review_required' | 'signals_detected' | 'no_signals_detected'
     method: string
     mlAnomaly?: {
       percentile: number

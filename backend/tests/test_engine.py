@@ -11,6 +11,7 @@ from dealpilot.engine import (
     _expense_proportions,
     _payment_signals,
     _financial_similarity,
+    _graph_cluster_signals,
     _preparer_details,
     _preparer_signals,
     _risk_scores,
@@ -18,6 +19,7 @@ from dealpilot.engine import (
     _supplier_concentration_signals,
     _supplier_name_variation_signals,
     _transaction_signals,
+    _transaction_timing_signals,
     _csv_transactions,
     _document_review_signals,
     analyze,
@@ -113,15 +115,16 @@ class PatternDetectionTests(unittest.TestCase):
         ]
         score = _risk_scores(signals, packets)["borrower a"]
         self.assertEqual(score["families"], ["document_identifier", "payment_relationship"])
-        self.assertEqual(score["score"], 6)
+        self.assertEqual(score["score"], 8)
         self.assertEqual(
             sum(item["points"] for item in score["scoreBreakdown"]),
             score["score"],
         )
         self.assertEqual(
             [item["points"] for item in score["scoreBreakdown"]],
-            [3, 3],
+            [4, 4],
         )
+        self.assertEqual(score["dimensions"]["crossDealCoordination"], 0)
 
     def test_family_priority_increases_with_corroborating_evidence(self) -> None:
         packets = [
@@ -161,14 +164,14 @@ class PatternDetectionTests(unittest.TestCase):
         }
         weak_score = _risk_scores([weak], packets)["borrower a"]["scoreBreakdown"][0]
         strong_score = _risk_scores([strong], packets)["borrower a"]["scoreBreakdown"][0]
-        self.assertEqual(weak_score["points"], 3)
-        self.assertEqual(weak_score["urgency"], "Low")
-        self.assertEqual(strong_score["points"], 25)
-        self.assertEqual(strong_score["urgency"], "Urgent")
+        self.assertEqual(weak_score["points"], 6)
+        self.assertEqual(weak_score["urgency"], "Moderate")
+        self.assertEqual(strong_score["points"], 20)
+        self.assertEqual(strong_score["urgency"], "High")
         self.assertGreater(strong_score["points"], weak_score["points"])
-        self.assertIn("5 distinct source documents +8", strong_score["rationale"])
-        self.assertIn("2 corroborating evidence types +2", strong_score["rationale"])
-        self.assertIn("3 connected applicants +3", strong_score["rationale"])
+        self.assertIn("independentCorroboration 72/100", strong_score["rationale"])
+        self.assertIn("evidenceReliability 90/100", strong_score["rationale"])
+        self.assertEqual(strong_score["dimensions"]["crossDealCoordination"], 70)
 
     def test_sequential_document_numbers_do_not_score_without_corroboration(self) -> None:
         packets = [type("Packet", (), {"name": "Borrower A"})()]
@@ -212,6 +215,84 @@ class PatternDetectionTests(unittest.TestCase):
         self.assertTrue(signals[0]["scoreContribution"])
         self.assertEqual(len(behavior), 3)
         self.assertTrue(all(not signal["scoreContribution"] for signal in behavior))
+
+    def test_transaction_timing_matches_normalized_sequences_without_ids_or_exact_amounts(self) -> None:
+        packets = []
+        for index, name in enumerate(("Business Alpha", "Business Beta", "Business Gamma")):
+            packet = Packet(name, name, [], name)
+            packet.transactions = [
+                {
+                    "date": f"2026-01-{day + (index % 2):02d}",
+                    "description": f"ACH DEBIT NORTHSTAR INDUSTRIAL SUPPLY INV-{index}{day}",
+                    "amount": float((1000 + event_index * 100) * (index + 1)),
+                    "direction": "debit",
+                    "source": f"{name}/statement.pdf:page {event_index + 1}",
+                }
+                for event_index, day in enumerate((5, 15, 25))
+            ]
+            packets.append(packet)
+
+        signals = _transaction_timing_signals(packets)
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]["family"], "transaction_timing_correlation")
+        self.assertEqual(signals[0]["transactionSummary"]["matchedPostingDates"], 3)
+        self.assertEqual(signals[0]["transactionSummary"]["normalizedSequenceMatches"], 3)
+        self.assertFalse(signals[0]["scoreContribution"])
+        self.assertNotIn("connectsInvestigation", signals[0])
+
+    def test_common_transaction_counterparty_is_not_flagged_as_a_rare_timing_cluster(self) -> None:
+        packets = []
+        for index in range(6):
+            name = f"Business {index}"
+            packet = Packet(name, name, [], name)
+            packet.transactions = [
+                {
+                    "date": f"2026-01-{day:02d}",
+                    "description": "ACH DEBIT NORTHSTAR INDUSTRIAL SUPPLY",
+                    "amount": float(1000 + index * 100),
+                    "direction": "debit",
+                    "source": f"{name}/statement.pdf:page 1",
+                }
+                for day in (5, 15, 25)
+            ]
+            packets.append(packet)
+        self.assertEqual(_transaction_timing_signals(packets), [])
+
+    def test_graph_cluster_requires_multiple_independent_relationship_families(self) -> None:
+        borrowers = ("Business Alpha", "Business Beta", "Business Gamma")
+        signals = [
+            {
+                "id": f"signal-{family}",
+                "family": family,
+                "scoreFamily": family,
+                "title": f"{family} relationship",
+                "borrowers": list(borrowers),
+                "severity": "High",
+                "scoreContribution": True,
+                "evidence": [
+                    {
+                        "text": f"{family} source {index}",
+                        "source": f"{family}-{index}.pdf:page 1",
+                        "kind": f"{family}_record",
+                    }
+                    for index in range(2)
+                ],
+            }
+            for family in ("supplier_relationship", "transaction_relationship", "financial_similarity")
+        ]
+        clusters = _graph_cluster_signals(signals)
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0]["graphSummary"]["relationshipFamilyCount"], 3)
+        self.assertEqual(clusters[0]["graphSummary"]["borrowerCount"], 3)
+        self.assertFalse(clusters[0]["scoreContribution"])
+        self.assertFalse(clusters[0]["graphSummary"]["historicalComparisonAvailable"])
+
+        observation = {
+            **signals[0],
+            "scoreContribution": False,
+            "classification": "shared_relationship_observation",
+        }
+        self.assertEqual(_graph_cluster_signals([observation]), [])
 
     def test_csv_statement_parser_skips_bank_export_preamble(self) -> None:
         folder = ROOT / "participant" / "participant" / "shared_folder" / "tyler loopwise loan stuff"
@@ -375,6 +456,20 @@ class DatasetIntegrationTests(unittest.TestCase):
         self.assertEqual(result["summary"]["currentPackets"], 13)
         self.assertEqual(len(result["scores"]), 13)
         self.assertEqual(len({score["folder"] for score in result["scores"]}), 13)
+        self.assertTrue(all(
+            score["assessmentStatus"] in {
+                "review_required", "signals_detected", "no_signals_detected"
+            }
+            for score in result["scores"]
+        ))
+        self.assertEqual(
+            {
+                borrower
+                for investigation in result["investigations"]
+                for borrower in investigation["borrowers"]
+            },
+            {score["borrower"] for score in result["scores"]},
+        )
         lone_star = next(
             score for score in result["scores"]
             if score["borrower"] == "Lone Star Family Dental PLLC"
@@ -398,6 +493,28 @@ class DatasetIntegrationTests(unittest.TestCase):
             result["mlModel"]["outlierApplications"],
             len(ml_findings),
         )
+        graph_cluster = next(
+            signal for signal in signals
+            if signal["family"] == "graph_relationship_cluster"
+        )
+        self.assertEqual(
+            set(graph_cluster["borrowers"]),
+            {
+                "Pecan Grove Catering Co LLC",
+                "Ridgeway Freight Logistics LLC",
+                "Summit Peak Flooring LLC",
+            },
+        )
+        self.assertFalse(graph_cluster["scoreContribution"])
+        target_investigation = next(
+            item for item in result["investigations"]
+            if "Ridgeway Freight Logistics LLC" in item["borrowers"]
+        )
+        self.assertEqual(len(target_investigation["borrowers"]), 3)
+        self.assertGreater(target_investigation["priorityScore"], 0)
+        self.assertFalse(target_investigation["scoreIsProbability"])
+        self.assertEqual(target_investigation["status"], "review_required")
+        self.assertEqual(target_investigation["evidenceConfidence"], 90)
         self.assertTrue(all(
             signal["scoreContribution"] is False
             and signal["mlAnomaly"]["isOutlier"]
@@ -441,9 +558,9 @@ class DatasetIntegrationTests(unittest.TestCase):
             for signal in structure_signals
         ))
         expected_scores = {
-            "Ridgeway Freight Logistics LLC": 74,
-            "Pecan Grove Catering Co LLC": 74,
-            "Summit Peak Flooring LLC": 58,
+            "Ridgeway Freight Logistics LLC": 59,
+            "Pecan Grove Catering Co LLC": 59,
+            "Summit Peak Flooring LLC": 47,
         }
         for borrower, expected_score in expected_scores.items():
             borrower_score = next(

@@ -42,12 +42,31 @@ its results require human review. The historical `none` label means no listed ba
 label, not independently confirmed fraud-free. Before operational use, validate against
 representative, independently adjudicated outcomes and monitor false positives.
 
-The separate uncalibrated investigation-priority index assigns each supported scoring
-family 1–25 points based on the strongest signal severity, distinct source documents,
-corroborating evidence types, and connected applicants. The total is capped at four
-families (100 points). The interface shows each contribution's urgency band and rationale;
-behavioral anomalies and document inconsistencies do not add points. This review index is
-not a fraud probability or a validated measure of loss.
+The separate, uncalibrated review-priority index weights evidence strength (35%),
+independent corroboration (25%), cross-deal coordination (20%), historical deviation
+(10%), and source traceability (10%). Each distinct scoring family contributes 1–25
+points, capped at four families (100 points). Correlated supplier findings and financial
+similarities are grouped to reduce double counting. Cluster assessments expose the
+dimension scores and unresolved legitimate explanations; evidence confidence describes
+source traceability and document diversity, not the truth of a claim. Behavioral anomalies,
+document inconsistencies, known bank-rule triggers, and whole-dollar patterns remain
+separate from novel-evidence points. Neither the index nor an anomaly percentile is a
+fraud probability or a validated measure of loss.
+
+Cross-deal analysis includes repeated transaction timing/sequence observations when
+multiple businesses share a normalized counterparty over several dates, plus a graph
+summary when multiple meaningful evidence families connect a cluster. Timing observations
+do not add points on their own, and common counterparties are suppressed as non-rare
+patterns. The graph summary organizes existing evidence; it does not claim statistical
+graph rarity because historical entity-link data is incomplete.
+
+The available historical files do not provide transaction-level records, verified
+beneficial-ownership links, independent supplier verification, or confirmed fraud-free
+outcomes for all unlabeled deals. Therefore, the engine does not train the Isolation Forest
+on transaction-sequence or graph features, and document/source reliability is limited to
+traceability available in extracted files. Supplier validation, document authenticity,
+complete fund-flow tracing, and ownership resolution require independently verified
+records and human review.
 
 The Fraud Checks view lists every current application and keeps novel pattern leads,
 the five known bank-rule results, document completeness/inconsistencies, and workflow

@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { FormEvent } from 'react'
-import { ShieldCheck } from 'lucide-react'
+import { ArrowUpRight, ShieldCheck } from 'lucide-react'
 import { login } from './data/authApi'
 import type { Employee } from './data/authApi'
 import './Auth.css'
@@ -33,9 +33,9 @@ export default function Auth({
   return (
     <main className="auth-page">
       <section className="auth-card" aria-labelledby="auth-title">
-        <div className="auth-brand-mark">GS</div>
+        <div className="auth-brand-mark" aria-hidden="true"><ArrowUpRight size={26} strokeWidth={2.4} /></div>
         <p className="auth-kicker">COMMERCIAL LENDING</p>
-        <h1 id="auth-title">Sign in to DealPilot</h1>
+        <h1 id="auth-title">Sign in to Verifin</h1>
         <p className="auth-intro">Use your company account to access your lending workspace.</p>
         <form className="auth-form" onSubmit={(event) => void submit(event)}>
           <label htmlFor="employee-email">Company email</label>

@@ -52,7 +52,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="DealPilot API",
+    title="Verifin API",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,

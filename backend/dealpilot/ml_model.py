@@ -56,7 +56,10 @@ class HistoricalAnomalyModel:
             "limitations": (
                 "Trained on historical deals without an existing bank-rule label. "
                 "Labels were excluded from features. The displayed percentile is an "
-                "anomaly rank, not a fraud probability or a validated performance metric."
+                "anomaly rank, not a fraud probability or a validated performance metric. "
+                "Graph and transaction-sequence features are not included because historical "
+                "transaction-level relationship data and validated outcomes are unavailable "
+                "for reliable training; those signals remain separately interpretable."
             ),
         }
 
